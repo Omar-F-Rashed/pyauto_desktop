@@ -1,48 +1,43 @@
 # Updated import to point to the new 'functions.py' inside the package
 from . import functions as pyauto_desktop
 from PyQt6.QtCore import QThread, pyqtSignal
+import traceback
 
 
 class DetectionWorker(QThread):
     """
     One-shot thread for image recognition.
-    Refactored to use the 'pyauto-desktop' module to ensure
-    preview behavior matches generated code behavior.
+    Accepts a 'Haystack' image to search within, ensuring
+    consistent coordinate mapping regardless of screen configuration.
     """
     result_signal = pyqtSignal(list, int)  # list of rects, count
 
-    def __init__(self, template_img, confidence, grayscale, region, overlap_threshold=0.5):
+    def __init__(self, template_img, haystack_img, confidence, grayscale, overlap_threshold=0.5):
         super().__init__()
         self.template_img = template_img
+        self.haystack_img = haystack_img
         self.confidence = confidence
         self.grayscale = grayscale
-        self.region = region
         self.overlap_threshold = overlap_threshold
 
     def run(self):
         try:
-            # We use the library function directly.
-            # Note: locateAllOnScreen returns Global coordinates.
-            rects = pyauto_desktop.locateAllOnScreen(
-                image=self.template_img,
-                region=self.region,
+            # We use locateAll(needle, haystack)
+            # This searches purely within the image data provided,
+            # avoiding any OS-level screen coordinate ambiguity.
+            rects = pyauto_desktop.locateAll(
+                needleImage=self.template_img,
+                haystackImage=self.haystack_img,
                 grayscale=self.grayscale,
                 confidence=self.confidence,
                 overlap_threshold=self.overlap_threshold
             )
 
-            final_rects = []
-            if self.region:
-                rx, ry, _, _ = self.region
-                for (x, y, w, h) in rects:
-                    final_rects.append((x - rx, y - ry, w, h))
-            else:
-                final_rects = rects
-
+            # Result rects are (x, y, w, h) relative to the Haystack Image (Physical Pixels)
+            final_rects = list(rects)
             self.result_signal.emit(final_rects, len(final_rects))
 
         except Exception as e:
             print(f"Error in detection worker: {e}")
-            import traceback
             traceback.print_exc()
             self.result_signal.emit([], 0)

@@ -2,9 +2,9 @@ import cv2
 import numpy as np
 from PIL import Image
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                             QPushButton, QSlider, QMessageBox, QScrollArea, QFileDialog, QWidget)
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QSize
-from PyQt6.QtGui import QImage, QPixmap, QCursor, QPainter, QColor, QPen
+                             QPushButton, QSlider, QMessageBox, QScrollArea, QWidget)
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QEvent
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 
 
 class EditorCanvas(QWidget):
@@ -26,7 +26,6 @@ class EditorCanvas(QWidget):
         # Crop State
         self.crop_rect = QRect()  # Image coords
         self.dragging_handle = None
-        self.last_mouse_pos = QPoint()
         self.handle_margin = 15  # Pixel distance to grab an edge
         self.is_wand_candidate = False
 
@@ -124,7 +123,6 @@ class EditorCanvas(QWidget):
         if on_top and (l - m < x < r + m): return 'T'
         if on_bottom and (l - m < x < r + m): return 'B'
 
-        # Note: We do NOT return 'MOVE' for inside, because 'Inside' is reserved for Magic Wand
         return None
 
     def mousePressEvent(self, event):
@@ -136,14 +134,10 @@ class EditorCanvas(QWidget):
         if hit:
             # Clicked on Edge/Corner -> Start Crop Drag
             self.dragging_handle = hit
-            self.last_mouse_pos = event.pos()
             self.crop_started.emit()  # Signal to push Undo
             self.is_wand_candidate = False
         else:
             # Clicked Inside/Outside -> Potential Magic Wand
-            # Only if inside the crop rect though?
-            # Actually, standard behavior: if outside crop, maybe ignore or just wand the dim part.
-            # Let's allow wanding anywhere, but typically user wands inside.
             self.is_wand_candidate = True
 
     def mouseMoveEvent(self, event):
@@ -217,8 +211,10 @@ class MagicWandEditor(QDialog):
 
     def __init__(self, pil_image, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Edit Template")
+        self.setWindowTitle("Edit Image")
         self.resize(900, 700)
+        # Enable Maximize/Minimize buttons
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
 
         # State
         # Stack elements: tuple(cv_image_copy, crop_rect_copy)
@@ -258,19 +254,9 @@ class MagicWandEditor(QDialog):
     def initUI(self):
         layout = QVBoxLayout(self)
 
-        # Top Bar: File Operations
-        top_bar = QHBoxLayout()
-        self.btn_open = QPushButton("Open Image")
-        self.btn_open.clicked.connect(self.open_image_dialog)
-        self.btn_open.setStyleSheet("background-color: #0d6efd; color: white;")
-
-        top_bar.addWidget(self.btn_open)
-        top_bar.addStretch()
-        layout.addLayout(top_bar)
-
         # Instructions
-        lbl_instr = QLabel("Drag edges to Crop. Click inside to Remove Background.")
-        lbl_instr.setStyleSheet("color: #aaa; font-style: italic;")
+        lbl_instr = QLabel("Drag edges to Crop. Click inside to Remove Background. Ctrl+Scroll to Zoom.")
+        lbl_instr.setStyleSheet("color: #aaa; font-style: italic; margin-bottom: 5px;")
         layout.addWidget(lbl_instr)
 
         # Scroll Area / Canvas
@@ -284,6 +270,10 @@ class MagicWandEditor(QDialog):
         self.canvas.crop_changed.connect(self.on_crop_changed)
 
         self.scroll_area.setWidget(self.canvas)
+
+        # Install event filter on viewport to capture Ctrl+Wheel
+        self.scroll_area.viewport().installEventFilter(self)
+
         layout.addWidget(self.scroll_area)
 
         self.zoom_level = max(0.1, min(self.zoom_level, 5.0))
@@ -337,18 +327,18 @@ class MagicWandEditor(QDialog):
 
         layout.addLayout(btn_layout)
 
-    def open_image_dialog(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
-        if fname:
-            try:
-                new_pil = Image.open(fname)
-                self.load_pil_image(new_pil)
-                self.reset_image_state()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load image:\n{e}")
+    def eventFilter(self, source, event):
+        """Filter events to allow Ctrl+Scroll zoom inside QScrollArea."""
+        if source == self.scroll_area.viewport() and event.type() == QEvent.Type.Wheel:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.perform_zoom_event(event)
+                return True  # Consume event to prevent scrolling
+            # Otherwise return False to let QScrollArea handle scrolling
+            return False
+        return super().eventFilter(source, event)
 
-    def wheelEvent(self, event):
-        """Handle zoom with scroll wheel."""
+    def perform_zoom_event(self, event):
+        """Helper to handle zoom logic from event."""
         delta = event.angleDelta().y()
         if delta > 0:
             self.zoom_level *= 1.1
@@ -359,7 +349,6 @@ class MagicWandEditor(QDialog):
         self.zoom_level = max(0.1, min(self.zoom_level, 5.0))
         self.canvas.zoom_level = self.zoom_level
         self.update_display()
-        event.accept()
 
     def on_tol_change(self):
         self.tolerance = self.slider_tol.value()
