@@ -16,10 +16,6 @@ from .overlay import Overlay
 from .detection import DetectionWorker
 from .editor import MagicWandEditor
 
-# --- SINGLE SOURCE OF TRUTH IMPORT ---
-# We import the monitor logic directly from functions.py so we share the exact same list.
-from .functions import get_monitors_safe
-
 # --- CRITICAL FIX: ENABLE DPI AWARENESS ---
 # This forces Windows to treat the app as "Per-Monitor DPI Aware V2".
 
@@ -252,33 +248,17 @@ class MainWindow(QMainWindow):
         hbox_screen = QHBoxLayout()
         self.cbo_screens = QComboBox()
 
+        screens = QApplication.screens()
+        for i, screen in enumerate(screens):
+            name = screen.name()
+            geo = screen.geometry()
+            self.cbo_screens.addItem(f"Screen {i + 1} ({geo.width()}x{geo.height()})", screen)
+
+        if len(screens) > 0:
+            self.cbo_screens.setCurrentIndex(0)  # Default to first screen
+
         hbox_screen.addWidget(QLabel("Detect On:"))
         hbox_screen.addWidget(self.cbo_screens)
-
-        # --- SINGLE SOURCE OF TRUTH LOGIC ---
-        # 1. Get authoritative list from functions.py
-        monitor_rects = get_monitors_safe()
-
-        # 2. Get Qt screens to find the matching objects
-        q_screens = QApplication.screens()
-
-        # 3. Iterate the Authoritative List and find the Qt match for each
-        for i, (mx, my, mw, mh) in enumerate(monitor_rects):
-            matched_q_screen = None
-
-            # Find the QScreen that has the exact same X,Y origin
-            for qs in q_screens:
-                geo = qs.geometry()
-                if geo.x() == mx and geo.y() == my:
-                    matched_q_screen = qs
-                    break
-
-            # Fallback (rare): If no coordinate match, try index if length matches
-            if not matched_q_screen and i < len(q_screens):
-                matched_q_screen = q_screens[i]
-
-            label = f"Screen {i} [Pos: {mx},{my}] ({mw}x{mh})"
-            self.cbo_screens.addItem(label, matched_q_screen)
 
         hbox_ctrl = QHBoxLayout()
         self.btn_start = QPushButton("Start Detection")

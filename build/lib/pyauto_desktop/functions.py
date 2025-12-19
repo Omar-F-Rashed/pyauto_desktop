@@ -4,13 +4,10 @@ from PIL import Image, ImageGrab
 from pynput.mouse import Button, Controller
 import platform
 import ctypes
-from . import dpi_manager
-from screeninfo import get_monitors
-
 
 # Initialize the controller once to save performance
 _mouse_controller = Controller()
-dpi_manager.enable_dpi_awareness()
+
 # --- Screen Routing & Configuration ---
 # Maps Logical Screen Index (Script) -> Physical Screen Index (Hardware)
 _SCREEN_ROUTER = {}
@@ -30,29 +27,18 @@ def _resolve_screen(screen_idx):
     return _SCREEN_ROUTER.get(screen_idx, screen_idx)
 
 
-def get_monitors_safe():
+def _get_monitors_safe():
     """
-    Returns a list of bounding boxes (x, y, w, h) for all connected monitors.
-    THIS IS THE SINGLE SOURCE OF TRUTH for both the GUI and the Runtime.
+    Returns a list of bounding boxes (x, y, w, h) for all connected monitors
+    in virtual screen coordinates.
     """
     monitors = []
 
-    # Priority 1: Use screeninfo (Recommended)
-    if get_monitors:
-        try:
-            # We trust the order returned by screeninfo implicitly.
-            si_monitors = get_monitors()
-            for m in si_monitors:
-                monitors.append((m.x, m.y, m.width, m.height))
-            return monitors
-        except Exception as e:
-            print(f"screeninfo error: {e}")
-
-    # Priority 2: Windows Fallback (ctypes)
-    if not monitors and platform.system() == "Windows":
+    if platform.system() == "Windows":
         try:
             user32 = ctypes.windll.user32
 
+            # Define necessary ctypes for EnumDisplayMonitors
             class RECT(ctypes.Structure):
                 _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                             ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -62,6 +48,7 @@ def get_monitors_safe():
 
             def _monitor_enum_proc(hMonitor, hdcMonitor, lprcMonitor, dwData):
                 r = lprcMonitor.contents
+                # Convert RECT to (x, y, w, h)
                 monitors.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
                 return True
 
@@ -69,14 +56,18 @@ def get_monitors_safe():
         except Exception:
             pass
 
-    # Priority 3: Last Resort (Virtual Desktop)
+    # Fallback: Treat the whole virtual desktop as one screen
     if not monitors:
         try:
+            # Helper to get full virtual size if possible, or just primary
+            # ImageGrab.grab() grabs all screens on Windows usually
             img = ImageGrab.grab()
             monitors.append((0, 0, img.width, img.height))
         except Exception:
-            monitors.append((0, 0, 1920, 1080))
+            monitors.append((0, 0, 1920, 1080))  # Last resort fallback
 
+    # Sort by X coordinate (Left to Right)
+    monitors.sort(key=lambda m: m[0])
     return monitors
 
 
@@ -101,12 +92,16 @@ def _load_image(img):
 def _non_max_suppression(boxes, overlap_thresh):
     """
     Standard Non-Maximum Suppression (NMS) to remove overlapping bounding boxes.
+    boxes: List of (x, y, w, h)
+    overlap_thresh: Float (0.0 to 1.0)
     """
     if len(boxes) == 0:
         return []
 
+    # Convert to float numpy array for calculations
     boxes = np.array(boxes, dtype=np.float32)
 
+    # Convert to [x1, y1, x2, y2] for NMS logic
     x1 = boxes[:, 0]
     y1 = boxes[:, 1]
     x2 = boxes[:, 0] + boxes[:, 2]
@@ -135,31 +130,38 @@ def _non_max_suppression(boxes, overlap_thresh):
         idxs = np.delete(idxs, np.concatenate(([last],
                                                np.where(overlap > overlap_thresh)[0])))
 
+    # Return as integers (x, y, w, h)
     return boxes[pick].astype("int").tolist()
 
 
 def _run_template_match(needleImage, haystackImage, grayscale=False):
     """
     Shared logic for preparing images and running cv2.matchTemplate.
+    Returns (result_matrix, needle_width, needle_height).
     """
+    # 1. Prepare Haystack
     haystack_pil = _load_image(haystackImage)
     haystack_np = np.array(haystack_pil)
 
+    # Handle RGB vs BGR (OpenCV uses BGR)
     if haystack_pil.mode == 'RGB':
         haystack = cv2.cvtColor(haystack_np, cv2.COLOR_RGB2BGR)
     elif haystack_pil.mode == 'RGBA':
         haystack = cv2.cvtColor(haystack_np, cv2.COLOR_RGBA2BGR)
     else:
+        # Grayscale or other
         haystack = haystack_np
         if len(haystack.shape) == 2:
             haystack = cv2.cvtColor(haystack, cv2.COLOR_GRAY2BGR)
 
+    # 2. Prepare Needle (Template)
     needle_pil = _load_image(needleImage)
     needle_np = np.array(needle_pil)
 
     needle = None
     mask = None
 
+    # Handle Alpha Channel in Template
     if needle_pil.mode == 'RGBA':
         needle_bgra = cv2.cvtColor(needle_np, cv2.COLOR_RGBA2BGRA)
         needle = needle_bgra[:, :, :3]
@@ -172,10 +174,12 @@ def _run_template_match(needleImage, haystackImage, grayscale=False):
             if len(needle.shape) == 2:
                 needle = cv2.cvtColor(needle, cv2.COLOR_GRAY2BGR)
 
+    # 3. Grayscale Option
     if grayscale:
         haystack = cv2.cvtColor(haystack, cv2.COLOR_BGR2GRAY)
         needle = cv2.cvtColor(needle, cv2.COLOR_BGR2GRAY)
 
+    # 4. Match
     if mask is not None and not grayscale:
         res = cv2.matchTemplate(haystack, needle, cv2.TM_CCOEFF_NORMED, mask=mask)
     else:
@@ -188,8 +192,12 @@ def _run_template_match(needleImage, haystackImage, grayscale=False):
 def locate(needleImage, haystackImage, grayscale=False, confidence=0.9):
     """
     Locate the BEST instance of 'needleImage' inside 'haystackImage'.
+    Uses cv2.minMaxLoc for efficiency (avoids processing all matches).
+    Returns (x, y, w, h) or None.
     """
     res, w, h = _run_template_match(needleImage, haystackImage, grayscale)
+
+    # Efficiently find the single global maximum (best match)
     minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
 
     if maxVal >= confidence:
@@ -204,14 +212,20 @@ def locateAll(needleImage, haystackImage, grayscale=False, confidence=0.9, overl
     """
     res, w, h = _run_template_match(needleImage, haystackImage, grayscale)
 
+    # Filter by Confidence
     loc = np.where(res >= confidence)
+
     rects = []
+    # loc is (y_indices, x_indices)
     for pt in zip(*loc[::-1]):
         rects.append([int(pt[0]), int(pt[1]), int(w), int(h)])
 
+    # Non-Max Suppression
     if overlap_threshold < 1.0 and len(rects) > 1:
         rects = _non_max_suppression(rects, overlap_threshold)
 
+    # --- FIX: Sort results to ensure Top-Left -> Bottom-Right ordering ---
+    # NMS can scramble order, so we force a sort by Y (row), then X (col).
     rects.sort(key=lambda r: (r[1], r[0]))
 
     return [tuple(r) for r in rects]
@@ -220,15 +234,24 @@ def locateAll(needleImage, haystackImage, grayscale=False, confidence=0.9, overl
 def locateAllOnScreen(image, region=None, screen=0, grayscale=False, confidence=0.9, overlap_threshold=0.5,
                       original_resolution=None):
     """
-    Locate all instances of 'image' on the screen.
+    Locate all instances of 'image' on the screen with smart resolution scaling and routing.
+
+    Args:
+        screen (int): Logical screen index (default 0).
+        original_resolution (tuple): (width, height) of the monitor where image was captured.
     """
+    # 1. Resolve Screen & Capture
     haystack_pil, offset_x, offset_y, scale_factor = _prepare_screen_capture(region, screen, original_resolution)
+
+    # 2. Resize Needle if needed
     needle_pil = _load_image(image)
     if scale_factor != 1.0:
         needle_pil = _resize_template(needle_pil, scale_factor)
 
+    # 3. Call core logic
     rects = locateAll(needle_pil, haystack_pil, grayscale, confidence, overlap_threshold)
 
+    # 4. Adjust Coordinates (Offset)
     if offset_x or offset_y:
         final_rects = []
         for (x, y, w, h) in rects:
@@ -241,13 +264,21 @@ def locateAllOnScreen(image, region=None, screen=0, grayscale=False, confidence=
 def locateOnScreen(image, region=None, screen=0, grayscale=False, confidence=0.9, overlap_threshold=0.5,
                    original_resolution=None):
     """
-    Locate the best instance of 'image' on the screen.
+    Locate the best instance of 'image' on the screen with smart resolution scaling and routing.
+
+    Args:
+        screen (int): Logical screen index (default 0).
+        original_resolution (tuple): (width, height) of the monitor where image was captured.
     """
+    # 1. Resolve Screen & Capture
     haystack_pil, offset_x, offset_y, scale_factor = _prepare_screen_capture(region, screen, original_resolution)
+
+    # 2. Resize Needle if needed
     needle_pil = _load_image(image)
     if scale_factor != 1.0:
         needle_pil = _resize_template(needle_pil, scale_factor)
 
+    # 3. Call optimized single-result logic
     result = locate(needle_pil, haystack_pil, grayscale, confidence)
 
     if result:
@@ -259,13 +290,16 @@ def locateOnScreen(image, region=None, screen=0, grayscale=False, confidence=0.9
 
 def _prepare_screen_capture(region, screen_idx, original_resolution):
     """
-    Internal helper that calls get_monitors_safe() to ensure alignment.
+    Internal helper to handle:
+    1. Virtual Screen Routing (Person A vs Person B)
+    2. Monitor Geometries
+    3. Scale Factor Calculation
+
+    Returns: (haystack_pil, offset_x, offset_y, scale_factor)
     """
     # 1. Routing
     physical_screen = _resolve_screen(screen_idx)
-
-    # CALL THE PUBLIC SAFE FUNCTION
-    monitors = get_monitors_safe()
+    monitors = _get_monitors_safe()
 
     # Safety Fallback
     if physical_screen >= len(monitors):
@@ -278,10 +312,12 @@ def _prepare_screen_capture(region, screen_idx, original_resolution):
     offset_x, offset_y = 0, 0
 
     if region:
+        # User specified a global region
         x, y, w, h = region
         haystack_pil = ImageGrab.grab(bbox=(x, y, x + w, y + h))
         offset_x, offset_y = x, y
     else:
+        # Full Monitor
         x, y, w, h = target_monitor_rect
         haystack_pil = ImageGrab.grab(bbox=(x, y, x + w, y + h))
         offset_x, offset_y = x, y
@@ -290,9 +326,15 @@ def _prepare_screen_capture(region, screen_idx, original_resolution):
     scale_factor = 1.0
 
     if original_resolution:
+        # Scale based on HEIGHT ratio of the MONITOR (not the region)
+        # This assumes UI scaling is consistent across the monitor
         orig_w, orig_h = original_resolution
         target_monitor_h = target_monitor_rect[3]
+
+        # Calculate ratio
         scale_factor = target_monitor_h / float(orig_h)
+
+        # Ignore negligible differences (floating point noise)
         if abs(scale_factor - 1.0) < 0.02:
             scale_factor = 1.0
 
@@ -308,17 +350,24 @@ def clickimage(match, offset=(0, 0), button='left', clicks=1):
         return
 
     x, y, w, h = match
+
+    # 1. Calculate Center
     center_x = x + (w / 2)
     center_y = y + (h / 2)
+
+    # 2. Apply Offset
     target_x = center_x + offset[0]
     target_y = center_y + offset[1]
 
+    # 3. Move
     _mouse_controller.position = (target_x, target_y)
 
+    # 4. Determine Button
     pynput_button = Button.left
     if button == 'right':
         pynput_button = Button.right
     elif button == 'middle':
         pynput_button = Button.middle
 
+    # 5. Click
     _mouse_controller.click(pynput_button, clicks)
