@@ -63,6 +63,7 @@ QSlider::groove:horizontal {
     margin: 2px 0;
     border-radius: 4px;
 }
+
 QSlider::handle:horizontal {
     background: #0d6efd;
     border: 1px solid #0d6efd;

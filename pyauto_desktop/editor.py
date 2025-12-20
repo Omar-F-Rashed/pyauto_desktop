@@ -2,26 +2,35 @@ import cv2
 import numpy as np
 from PIL import Image
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                             QPushButton, QSlider, QMessageBox, QScrollArea, QWidget)
+                             QPushButton, QSlider, QMessageBox, QScrollArea, QWidget,
+                             QRadioButton, QButtonGroup, QFrame)
 from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint, QEvent
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QCursor
 
 
 class EditorCanvas(QWidget):
     """
     Custom widget for displaying image and handling interactions.
-    - Edges/Corners: Resize Crop Rect
-    - Inside: Click to Magic Wand
+    Modes:
+    1. Wand (Default): Edges/Corners resize Crop. Inside clicks trigger Magic Wand.
+    2. Eraser: Click and drag to manually set pixels to transparent. Ignores Crop handles.
     """
     wand_clicked = pyqtSignal(int, int)  # x, y (image coords)
+    eraser_stroked = pyqtSignal(int, int)  # x, y (image coords)
     crop_changed = pyqtSignal(QRect)  # Emitted when drag ends (for syncing state)
-    crop_started = pyqtSignal()  # Emitted when drag starts (for Undo)
+    action_started = pyqtSignal()  # Emitted when drag/stroke starts (for Undo)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.pixmap = None
         self.zoom_level = 1.0
+
+        # Tools
+        self.tool_mode = 'wand'  # 'wand' or 'eraser'
+        self.eraser_size = 20
+        self.is_erasing = False
+        self.cursor_pos = QPoint(-100, -100)  # For drawing brush cursor
 
         # Crop State
         self.crop_rect = QRect()  # Image coords
@@ -43,6 +52,10 @@ class EditorCanvas(QWidget):
         self.crop_rect = rect
         self.update()
 
+    def set_tool_mode(self, mode):
+        self.tool_mode = mode
+        self.update()
+
     def get_crop_rect_view(self):
         """Returns the crop rect scaled to the current zoom level (View Coordinates)."""
         if self.crop_rect.isNull():
@@ -62,46 +75,61 @@ class EditorCanvas(QWidget):
         target_rect = self.rect()
         painter.drawPixmap(target_rect, self.pixmap)
 
-        # 2. Draw Crop Overlay (Always active)
+        # 2. Draw Crop Overlay
+        # We always draw the overlay so the user sees the output bounds,
+        # but handles are only drawn/interactive in Wand mode.
         crop_view = self.get_crop_rect_view()
-        if not crop_view.isValid():
-            return
+        if crop_view.isValid():
 
-        x, y, w, h = crop_view.x(), crop_view.y(), crop_view.width(), crop_view.height()
-        view_w, view_h = self.width(), self.height()
+            x, y, w, h = crop_view.x(), crop_view.y(), crop_view.width(), crop_view.height()
+            view_w, view_h = self.width(), self.height()
 
-        # Dim outside area
-        painter.setBrush(QColor(0, 0, 0, 150))  # Darker dimmer
-        painter.setPen(Qt.PenStyle.NoPen)
+            # Dim outside area
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.setPen(Qt.PenStyle.NoPen)
 
-        # Draw 4 rectangles around the crop area (Top, Bottom, Left, Right)
-        # Prevents overdraw on the transparent crop area
-        painter.drawRect(0, 0, view_w, y)  # Top
-        painter.drawRect(0, y + h, view_w, view_h - (y + h))  # Bottom
-        painter.drawRect(0, y, x, h)  # Left
-        painter.drawRect(x + w, y, view_w - (x + w), h)  # Right
+            # Draw 4 rectangles around the crop area
+            painter.drawRect(0, 0, view_w, y)  # Top
+            painter.drawRect(0, y + h, view_w, view_h - (y + h))  # Bottom
+            painter.drawRect(0, y, x, h)  # Left
+            painter.drawRect(x + w, y, view_w - (x + w), h)  # Right
 
-        # Draw Crop Border
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        pen = QPen(Qt.GlobalColor.white, 2, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.drawRect(crop_view)
+            # Draw Crop Border
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            pen = QPen(Qt.GlobalColor.white, 2, Qt.PenStyle.SolidLine)
+            if self.tool_mode == 'eraser':
+                pen.setStyle(Qt.PenStyle.DashLine)  # Dash line in eraser mode to show it's "inactive"
+                pen.setColor(QColor(200, 200, 200, 150))
+            painter.setPen(pen)
+            painter.drawRect(crop_view)
 
-        # Draw Corner Handles
-        painter.setBrush(Qt.GlobalColor.white)
-        painter.setPen(Qt.GlobalColor.black)
-        handle_len = 6
-        # Corners
-        painter.drawRect(x - handle_len, y - handle_len, handle_len * 2, handle_len * 2)  # TL
-        painter.drawRect(x + w - handle_len, y - handle_len, handle_len * 2, handle_len * 2)  # TR
-        painter.drawRect(x - handle_len, y + h - handle_len, handle_len * 2, handle_len * 2)  # BL
-        painter.drawRect(x + w - handle_len, y + h - handle_len, handle_len * 2, handle_len * 2)  # BR
+            # Draw Corner Handles (Only in Wand Mode)
+            if self.tool_mode == 'wand':
+                painter.setBrush(Qt.GlobalColor.white)
+                painter.setPen(Qt.GlobalColor.black)
+                handle_len = 6
+                painter.drawRect(x - handle_len, y - handle_len, handle_len * 2, handle_len * 2)  # TL
+                painter.drawRect(x + w - handle_len, y - handle_len, handle_len * 2, handle_len * 2)  # TR
+                painter.drawRect(x - handle_len, y + h - handle_len, handle_len * 2, handle_len * 2)  # BL
+                painter.drawRect(x + w - handle_len, y + h - handle_len, handle_len * 2, handle_len * 2)  # BR
+
+        # 3. Draw Eraser Cursor
+        if self.tool_mode == 'eraser':
+            painter.setPen(QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.SolidLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            # Size in view pixels
+            radius_view = (self.eraser_size * self.zoom_level) / 2
+            painter.drawEllipse(self.cursor_pos, int(radius_view), int(radius_view))
 
     def _get_hit_code(self, pos, rect):
         """
         Determines which edge or corner the mouse is hovering over.
         Returns: 'TL', 'T', 'TR', 'R', 'BR', 'B', 'BL', 'L' or None
         """
+        # If in eraser mode, we ignore handles so user can erase near edges freely
+        if self.tool_mode == 'eraser':
+            return None
+
         x, y = pos.x(), pos.y()
         l, t, r, b = rect.left(), rect.top(), rect.right(), rect.bottom()
         m = self.handle_margin
@@ -128,13 +156,25 @@ class EditorCanvas(QWidget):
     def mousePressEvent(self, event):
         if not self.pixmap: return
 
+        # Calculate image coords
+        img_x = int(event.pos().x() / self.zoom_level)
+        img_y = int(event.pos().y() / self.zoom_level)
+
+        # ERASER LOGIC
+        if self.tool_mode == 'eraser':
+            self.is_erasing = True
+            self.action_started.emit()  # Save state for Undo
+            self.eraser_stroked.emit(img_x, img_y)
+            return
+
+        # WAND / CROP LOGIC
         view_rect = self.get_crop_rect_view()
         hit = self._get_hit_code(event.pos(), view_rect)
 
         if hit:
             # Clicked on Edge/Corner -> Start Crop Drag
             self.dragging_handle = hit
-            self.crop_started.emit()  # Signal to push Undo
+            self.action_started.emit()  # Signal to push Undo
             self.is_wand_candidate = False
         else:
             # Clicked Inside/Outside -> Potential Magic Wand
@@ -143,7 +183,23 @@ class EditorCanvas(QWidget):
     def mouseMoveEvent(self, event):
         if not self.pixmap: return
 
+        # Update cursor pos for eraser visual
+        self.cursor_pos = event.pos()
+
         view_rect = self.get_crop_rect_view()
+        img_x = int(event.pos().x() / self.zoom_level)
+        img_y = int(event.pos().y() / self.zoom_level)
+
+        # ERASER LOGIC
+        if self.tool_mode == 'eraser':
+            if self.is_erasing:
+                self.eraser_stroked.emit(img_x, img_y)
+
+            self.update()  # Repaint to update cursor circle
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+
+        # WAND / CROP LOGIC
 
         # 1. Update Cursor if not dragging
         if not self.dragging_handle:
@@ -161,16 +217,13 @@ class EditorCanvas(QWidget):
 
         # 2. Handle Dragging
         else:
-            mx = int(event.pos().x() / self.zoom_level)
-            my = int(event.pos().y() / self.zoom_level)
-
             # Image bounds
             img_w = int(self.pixmap.width() / self.zoom_level)
             img_h = int(self.pixmap.height() / self.zoom_level)
 
             # Clamp mouse to image area
-            mx = max(0, min(mx, img_w))
-            my = max(0, min(my, img_h))
+            mx = max(0, min(img_x, img_w))
+            my = max(0, min(img_y, img_h))
 
             r = self.crop_rect
             l, t, r_edge, b = r.left(), r.top(), r.right(), r.bottom()
@@ -192,6 +245,10 @@ class EditorCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if self.tool_mode == 'eraser':
+            self.is_erasing = False
+            return
+
         if self.dragging_handle:
             self.dragging_handle = None
             self.crop_changed.emit(self.crop_rect)
@@ -206,13 +263,13 @@ class EditorCanvas(QWidget):
 
 class MagicWandEditor(QDialog):
     """
-    A simple image editor to remove backgrounds using FloodFill (Magic Wand) and Crop.
+    A simple image editor to remove backgrounds using FloodFill (Magic Wand), Eraser, and Crop.
     """
 
     def __init__(self, pil_image, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Image")
-        self.resize(900, 700)
+        self.resize(1000, 800)
         # Enable Maximize/Minimize buttons
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint)
 
@@ -254,10 +311,71 @@ class MagicWandEditor(QDialog):
     def initUI(self):
         layout = QVBoxLayout(self)
 
-        # Instructions
-        lbl_instr = QLabel("Drag edges to Crop. Click inside to Remove Background. Ctrl+Scroll to Zoom.")
-        lbl_instr.setStyleSheet("color: #aaa; font-style: italic; margin-bottom: 5px;")
+        # Header Instructions
+        lbl_instr = QLabel("Use <b>Magic Wand</b> to auto-remove background, or <b>Eraser</b> for manual cleanup.<br>"
+                           "Drag edges to Crop. <i>(Ctrl+Scroll to Zoom, Shift+Scroll to Resize Eraser, Ctrl+Z Undo, Ctrl+Shift+Z Redo)</i>")
+        lbl_instr.setStyleSheet("color: #aaa; margin-bottom: 5px;")
         layout.addWidget(lbl_instr)
+
+        # --- TOOLBAR ---
+        toolbar = QHBoxLayout()
+
+        # Tool Selection Group
+        self.btn_group = QButtonGroup(self)
+
+        self.rad_wand = QRadioButton("Magic Wand")
+        self.rad_wand.setChecked(True)
+        self.rad_wand.toggled.connect(self.on_tool_changed)
+
+        self.rad_eraser = QRadioButton("Eraser")
+        self.rad_eraser.toggled.connect(self.on_tool_changed)
+
+        self.btn_group.addButton(self.rad_wand)
+        self.btn_group.addButton(self.rad_eraser)
+
+        toolbar.addWidget(QLabel("Tool:"))
+        toolbar.addWidget(self.rad_wand)
+        toolbar.addWidget(self.rad_eraser)
+
+        # Separator
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        toolbar.addWidget(line)
+
+        # Wand Controls
+        self.container_wand = QWidget()
+        layout_wand = QHBoxLayout(self.container_wand)
+        layout_wand.setContentsMargins(0, 0, 0, 0)
+        layout_wand.addWidget(QLabel("Wand Tolerance:"))
+        self.slider_tol = QSlider(Qt.Orientation.Horizontal)
+        self.slider_tol.setRange(0, 150)
+        self.slider_tol.setValue(40)
+        self.slider_tol.valueChanged.connect(self.on_tol_change)
+        self.lbl_tol_val = QLabel("40")
+        layout_wand.addWidget(self.slider_tol)
+        layout_wand.addWidget(self.lbl_tol_val)
+
+        # Eraser Controls
+        self.container_eraser = QWidget()
+        layout_eraser = QHBoxLayout(self.container_eraser)
+        layout_eraser.setContentsMargins(0, 0, 0, 0)
+        layout_eraser.addWidget(QLabel("Eraser Size:"))
+        self.slider_size = QSlider(Qt.Orientation.Horizontal)
+        self.slider_size.setRange(5, 100)
+        self.slider_size.setValue(20)
+        self.slider_size.valueChanged.connect(self.on_size_change)
+        self.lbl_size_val = QLabel("20px")
+        layout_eraser.addWidget(self.slider_size)
+        layout_eraser.addWidget(self.lbl_size_val)
+        self.container_eraser.setVisible(False)  # Hidden by default
+
+        toolbar.addWidget(self.container_wand)
+        toolbar.addWidget(self.container_eraser)
+        toolbar.addStretch()
+
+        layout.addLayout(toolbar)
+        # ----------------
 
         # Scroll Area / Canvas
         self.scroll_area = QScrollArea()
@@ -266,7 +384,8 @@ class MagicWandEditor(QDialog):
 
         self.canvas = EditorCanvas()
         self.canvas.wand_clicked.connect(self.apply_magic_wand)
-        self.canvas.crop_started.connect(self.push_undo)
+        self.canvas.eraser_stroked.connect(self.apply_eraser)
+        self.canvas.action_started.connect(self.push_undo)
         self.canvas.crop_changed.connect(self.on_crop_changed)
 
         self.scroll_area.setWidget(self.canvas)
@@ -276,22 +395,11 @@ class MagicWandEditor(QDialog):
 
         layout.addWidget(self.scroll_area)
 
+        # Undo/Redo Controls
         self.zoom_level = max(0.1, min(self.zoom_level, 5.0))
         ctrl_layout = QHBoxLayout()
-
-        # Wand Controls
-        ctrl_layout.addWidget(QLabel("Wand Tolerance:"))
-        self.slider_tol = QSlider(Qt.Orientation.Horizontal)
-        self.slider_tol.setRange(0, 150)
-        self.slider_tol.setValue(40)
-        self.slider_tol.valueChanged.connect(self.on_tol_change)
-        self.lbl_tol_val = QLabel("40")
-        ctrl_layout.addWidget(self.slider_tol)
-        ctrl_layout.addWidget(self.lbl_tol_val)
-
         ctrl_layout.addStretch()
 
-        # Undo/Redo/Reset
         self.btn_undo = QPushButton("Undo")
         self.btn_undo.clicked.connect(self.undo)
         self.btn_undo.setEnabled(False)
@@ -330,10 +438,18 @@ class MagicWandEditor(QDialog):
     def eventFilter(self, source, event):
         """Filter events to allow Ctrl+Scroll zoom inside QScrollArea."""
         if source == self.scroll_area.viewport() and event.type() == QEvent.Type.Wheel:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            modifiers = event.modifiers()
+
+            # Zoom: Ctrl + Scroll
+            if modifiers & Qt.KeyboardModifier.ControlModifier:
                 self.perform_zoom_event(event)
-                return True  # Consume event to prevent scrolling
-            # Otherwise return False to let QScrollArea handle scrolling
+                return True
+
+            # Eraser Size: Shift + Scroll
+            if (modifiers & Qt.KeyboardModifier.ShiftModifier) and self.rad_eraser.isChecked():
+                self.perform_eraser_resize_event(event)
+                return True
+
             return False
         return super().eventFilter(source, event)
 
@@ -350,9 +466,47 @@ class MagicWandEditor(QDialog):
         self.canvas.zoom_level = self.zoom_level
         self.update_display()
 
+    def perform_eraser_resize_event(self, event):
+        """Helper to resize eraser from event."""
+        delta = event.angleDelta().y()
+        # Step size
+        step = 5
+        current_val = self.slider_size.value()
+
+        if delta > 0:
+            self.slider_size.setValue(current_val + step)
+        else:
+            self.slider_size.setValue(current_val - step)
+
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts for Undo/Redo."""
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_Z:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.redo()
+                else:
+                    self.undo()
+        super().keyPressEvent(event)
+
+    def on_tool_changed(self):
+        if self.rad_wand.isChecked():
+            self.canvas.set_tool_mode('wand')
+            self.container_wand.setVisible(True)
+            self.container_eraser.setVisible(False)
+        else:
+            self.canvas.set_tool_mode('eraser')
+            self.container_wand.setVisible(False)
+            self.container_eraser.setVisible(True)
+
     def on_tol_change(self):
         self.tolerance = self.slider_tol.value()
         self.lbl_tol_val.setText(str(self.tolerance))
+
+    def on_size_change(self):
+        size = self.slider_size.value()
+        self.canvas.eraser_size = size
+        self.lbl_size_val.setText(f"{size}px")
+        self.canvas.update()  # Update cursor size visual
 
     def on_crop_changed(self, new_rect):
         """Called when user finishes dragging a crop handle."""
@@ -450,8 +604,7 @@ class MagicWandEditor(QDialog):
             # Set Alpha channel (index 3) to 0 where mask is 255
             self.cv_image[:, :, 3][region_mask == 255] = 0
 
-            # CRITICAL FIX: Also set RGB to 0.
-            # If we don't, Grayscale conversion (which drops Alpha) will still see the original background pixels.
+            # Also set RGB to 0 (cleaner buffer)
             self.cv_image[:, :, 0][region_mask == 255] = 0
             self.cv_image[:, :, 1][region_mask == 255] = 0
             self.cv_image[:, :, 2][region_mask == 255] = 0
@@ -460,6 +613,18 @@ class MagicWandEditor(QDialog):
             print(f"FloodFill Error: {e}")
             if self.undo_stack: self.undo_stack.pop()
 
+        self.update_display()
+
+    def apply_eraser(self, x, y):
+        """Draws a transparent circle on the CV image at x,y."""
+        if not hasattr(self, 'cv_image'): return
+
+        radius = int(self.canvas.eraser_size / 2)
+        # Color: (B, G, R, A) -> (0,0,0,0) transparent
+        color = (0, 0, 0, 0)
+
+        # Draw filled circle
+        cv2.circle(self.cv_image, (x, y), radius, color, -1)
         self.update_display()
 
     def get_result(self):

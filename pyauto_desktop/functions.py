@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 from PIL import Image, ImageGrab
@@ -238,23 +239,33 @@ def locateAllOnScreen(image, region=None, screen=0, grayscale=False, confidence=
     return rects
 
 
-def locateOnScreen(image, region=None, screen=0, grayscale=False, confidence=0.9, overlap_threshold=0.5,
+def locateOnScreen(image, region=None, screen=0, grayscale=False, confidence=0.9,
                    original_resolution=None):
     """
-    Locate the best instance of 'image' on the screen.
+    Locate the first instance of 'image' on the screen.
     """
+    # 1. Prepare screen and image (Same as your existing functions)
     haystack_pil, offset_x, offset_y, scale_factor = _prepare_screen_capture(region, screen, original_resolution)
     needle_pil = _load_image(image)
     if scale_factor != 1.0:
         needle_pil = _resize_template(needle_pil, scale_factor)
 
-    result = locate(needle_pil, haystack_pil, grayscale, confidence)
+    # 2. Get raw matches (Generator or List)
+    # We use locateAll because it returns results sorted by position (top-left to bottom-right)
+    # whereas locate() returns results sorted by confidence.
+    rects = locateAll(needle_pil, haystack_pil, grayscale, confidence)
 
-    if result:
-        x, y, w, h = result
-        return (x + offset_x, y + offset_y, w, h)
+    # 3. OPTIMIZATION: Extract only the first item immediately
+    # This works whether 'rects' is a list or a generator
+    try:
+        first_match = next(iter(rects))
+    except StopIteration:
+        return None  # No matches found
 
-    return result
+    # 4. Apply offset ONLY to the first match
+    # (Your original function applied this math to every single match found)
+    x, y, w, h = first_match
+    return (x + offset_x, y + offset_y, w, h)
 
 
 def _prepare_screen_capture(region, screen_idx, original_resolution):
