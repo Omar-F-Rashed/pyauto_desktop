@@ -1,3 +1,6 @@
+import concurrent.futures
+import time
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -5,13 +8,11 @@ from PIL import Image, ImageGrab
 from pynput.mouse import Button, Controller
 import platform
 import ctypes
-from . import dpi_manager
 from screeninfo import get_monitors
 
 
 # Initialize the controller once to save performance
 _mouse_controller = Controller()
-dpi_manager.enable_dpi_awareness()
 # --- Screen Routing & Configuration ---
 # Maps Logical Screen Index (Script) -> Physical Screen Index (Hardware)
 _SCREEN_ROUTER = {}
@@ -157,8 +158,6 @@ def _run_template_match(needleImage, haystackImage, grayscale=False):
 
     needle_pil = _load_image(needleImage)
     needle_np = np.array(needle_pil)
-
-    needle = None
     mask = None
 
     if needle_pil.mode == 'RGBA':
@@ -186,17 +185,6 @@ def _run_template_match(needleImage, haystackImage, grayscale=False):
     return res, w, h
 
 
-def locate(needleImage, haystackImage, grayscale=False, confidence=0.9):
-    """
-    Locate the BEST instance of 'needleImage' inside 'haystackImage'.
-    """
-    res, w, h = _run_template_match(needleImage, haystackImage, grayscale)
-    minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
-
-    if maxVal >= confidence:
-        return (maxLoc[0], maxLoc[1], w, h)
-
-    return None
 
 
 def locateAll(needleImage, haystackImage, grayscale=False, confidence=0.9, overlap_threshold=0.5):
@@ -269,46 +257,65 @@ def locateOnScreen(image, region=None, screen=0, grayscale=False, confidence=0.9
 
 
 def _prepare_screen_capture(region, screen_idx, original_resolution):
-    """
-    Internal helper that calls get_monitors_safe() to ensure alignment.
-    """
-    # 1. Routing
+    # 1. Routing & Monitor Info
     physical_screen = _resolve_screen(screen_idx)
-
-    # CALL THE PUBLIC SAFE FUNCTION
     monitors = get_monitors_safe()
 
-    # Safety Fallback
+    # Fallback to Primary if screen doesn't exist
     if physical_screen >= len(monitors):
-        print(f"Warning: Screen {physical_screen} not found. Falling back to Primary (0).")
         physical_screen = 0
 
-    target_monitor_rect = monitors[physical_screen]
+    # Get the Global X/Y where this specific monitor starts
+    monitor_left, monitor_top, monitor_width, monitor_height = monitors[physical_screen]
 
-    # 2. Determine Capture Area
-    offset_x, offset_y = 0, 0
-
+    # 2. CALCULATE CAPTURE AREA (The Math)
     if region:
-        x, y, w, h = region
-        haystack_pil = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-        offset_x, offset_y = x, y
+        # User provided local region (x, y, w, h)
+        local_x, local_y, local_w, local_h = region
+
+        # CALCULATION:
+        # Global X = Monitor Global Start + Local Region Start
+        # Global Y = Monitor Global Start + Local Region Start
+        capture_left = monitor_left + local_x
+        capture_top = monitor_top + local_y
+
+        # The Bottom-Right is simply the Start + Width/Height
+        capture_right = capture_left + local_w
+        capture_bottom = capture_top + local_h
+
+        # Store these for later so we know where to click
+        offset_x = capture_left
+        offset_y = capture_top
     else:
-        x, y, w, h = target_monitor_rect
-        haystack_pil = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-        offset_x, offset_y = x, y
+        # No region? Capture the full monitor.
+        capture_left = monitor_left
+        capture_top = monitor_top
+        capture_right = monitor_left + monitor_width
+        capture_bottom = monitor_top + monitor_height
 
-    # 3. Determine Scale Factor
+        offset_x, offset_y = monitor_left, monitor_top
+
+    # 3. EFFICIENT CAPTURE
+    # We ask the OS for ONLY the specific rectangle we calculated.
+    try:
+        haystack_pil = ImageGrab.grab(bbox=(capture_left, capture_top, capture_right, capture_bottom), all_screens=True)
+    except TypeError:
+        # Fallback for older Pillow versions that don't support 'all_screens'
+        print("You have an old Pillow version that doesn't support secondary screens, upgrade or"
+              " you wont be able to detect except in primary screen.")
+        haystack_pil = ImageGrab.grab(bbox=(capture_left, capture_top, capture_right, capture_bottom))
+
+    # haystack_pil.save('test.png')
+    # 4. Scaling (Standard)
+
     scale_factor = 1.0
-
     if original_resolution:
         orig_w, orig_h = original_resolution
-        target_monitor_h = target_monitor_rect[3]
-        scale_factor = target_monitor_h / float(orig_h)
+        scale_factor = monitor_height / float(orig_h)
         if abs(scale_factor - 1.0) < 0.02:
             scale_factor = 1.0
 
     return haystack_pil, offset_x, offset_y, scale_factor
-
 
 def clickimage(match, offset=(0, 0), button='left', clicks=1):
     """
@@ -333,3 +340,118 @@ def clickimage(match, offset=(0, 0), button='left', clicks=1):
         pynput_button = Button.middle
 
     _mouse_controller.click(pynput_button, clicks)
+
+
+def _parse_task(task, default_screen=0):
+    """
+    Normalizes task into:
+    {'label': str, 'image': str, 'region': tuple/None, 'confidence': float, 'screen': int}
+    """
+    defaults = {'region': None, 'confidence': 0.9, 'screen': default_screen, 'grayscale': True}
+
+    if isinstance(task, dict):
+        base = defaults.copy()
+        base.update(task)
+        return base
+
+
+    raise ValueError(f"Invalid task format: {task}")
+
+def locate_any(tasks, timeout=5, default_screen=0):
+    parsed_tasks = [_parse_task(t, default_screen) for t in tasks]
+
+    start_time = time.time()
+
+    # --------------------------------------------------
+    # FAST PROBE (single-pass, sequential)
+    # --------------------------------------------------
+    for t in parsed_tasks:
+        match = locateOnScreen(
+            image=t['image'],
+            region=t['region'],
+            screen=t['screen'],
+            grayscale=t['grayscale'],
+            confidence=t['confidence']
+        )
+        if match:
+            return (t['label'], match)
+
+    # No waiting requested
+    if timeout <= 0:
+        return None
+
+    # --------------------------------------------------
+    # WAIT MODE
+    # --------------------------------------------------
+    while True:
+        for t in parsed_tasks:
+            match = locateOnScreen(
+                image=t['image'],
+                region=t['region'],
+                screen=t['screen'],
+                grayscale=t['grayscale'],
+                confidence=t['confidence']
+            )
+            if match:
+                return (t['label'], match)
+        if time.time() - start_time > timeout:
+            break
+
+        # Small sleep to avoid hammering the compositor
+        time.sleep(0.01)
+
+    return None
+
+
+
+def locate_all(tasks, timeout=0, default_screen=0):
+    parsed_tasks = [_parse_task(t, default_screen) for t in tasks]
+    results = {t['label']: None for t in parsed_tasks}
+
+    start_time = time.time()
+
+    # --------------------------------------------------
+    # FAST PROBE (single-pass)
+    # --------------------------------------------------
+    for t in parsed_tasks:
+        matches = locateAllOnScreen(
+            image=t['image'],
+            region=t['region'],
+            screen=t['screen'],
+            grayscale=t['grayscale'],
+            confidence=t['confidence']
+        )
+        if matches:
+            results[t['label']] = matches
+
+    # If no waiting requested or everything found
+    if timeout <= 0 or all(results.values()):
+        return results
+
+    # --------------------------------------------------
+    # WAIT MODE
+    # --------------------------------------------------
+    while True:
+        for t in parsed_tasks:
+            if results[t['label']] is not None:
+                continue
+
+            matches = locateAllOnScreen(
+                image=t['image'],
+                region=t['region'],
+                screen=t['screen'],
+                grayscale=t['grayscale'],
+                confidence=t['confidence']
+            )
+            if matches:
+                results[t['label']] = matches
+
+        if all(results.values()):
+            break
+
+        if time.time() - start_time > timeout:
+            break
+
+        time.sleep(0.01)
+
+    return results

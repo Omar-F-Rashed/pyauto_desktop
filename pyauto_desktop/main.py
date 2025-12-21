@@ -853,6 +853,11 @@ class MainWindow(QMainWindow):
         # --- FIX: GET DPR TO SCALE GENERATED COORDINATES ---
         dpr = screen_obj.devicePixelRatio()
 
+        # Get Screen Geometry (Logical) to calculate local coordinates
+        screen_geo = screen_obj.geometry()
+        screen_x_log = screen_geo.x()
+        screen_y_log = screen_geo.y()
+
         # Physical width/height of the screen for fallback
         phys_w = int(screen_obj.geometry().width() * dpr)
         phys_h = int(screen_obj.geometry().height() * dpr)
@@ -876,11 +881,16 @@ class MainWindow(QMainWindow):
             if region_var:
                 p.append(f"region={region_var}")
             elif self.search_region and not self.chk_anchor_mode.isChecked():
-                # FIX: Scale static search region to Physical Pixels
+                # FIX: Scale static search region to Physical Pixels AND Make Local
                 rx, ry, rw, rh = self.search_region
+
+                # Convert global capture to local relative to the selected screen
+                local_rx = rx - screen_x_log
+                local_ry = ry - screen_y_log
+
                 phys_region = (
-                    int(rx * dpr),
-                    int(ry * dpr),
+                    int(local_rx * dpr),
+                    int(local_ry * dpr),
                     int(rw * dpr),
                     int(rh * dpr)
                 )
@@ -980,7 +990,6 @@ class MainWindow(QMainWindow):
         self.txt_output.setText(code_block)
         QApplication.clipboard().setText(code_block)
         self.lbl_status.setText("Code copied to clipboard!")
-
     # --- Utils ---
     def pil2pixmap(self, image):
         if image.mode == "RGBA":
@@ -1024,7 +1033,7 @@ def run_inspector():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    app.exec()
 
 
 if __name__ == "__main__":

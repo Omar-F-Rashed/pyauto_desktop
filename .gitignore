@@ -2,6 +2,7 @@
 images/
 *.png
 testing.py
+automated_tester.py
 
 __pycache__/
 *.py[cod]

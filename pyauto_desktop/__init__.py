@@ -1,4 +1,4 @@
-from .functions import locateOnScreen, locateAllOnScreen, clickimage
+from .functions import locateOnScreen, locateAllOnScreen, clickimage, locate_any, locate_all
 
 # Import the GUI runner from main.py
 from .main import run_inspector as inspector
@@ -7,4 +7,6 @@ from . import dpi_manager
 # Enable DPI awareness automatically on import
 # This fixes coordinates for mixed-DPI and VSR screens
 dpi_manager.enable_dpi_awareness()
-__all__ = ['locateOnScreen', 'locateAllOnScreen', 'clickimage', 'inspector']
+__all__ = ['locateOnScreen', 'locateAllOnScreen', 'clickimage', 'inspector', 'dpi_manager', 'locate_any', 'locate_all']
+
+
