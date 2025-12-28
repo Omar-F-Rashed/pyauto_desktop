@@ -2,6 +2,8 @@
 
 **The resolution-agnostic, high-performance automation library for Python.**
 
+📘 **Documentation:** [Read the full docs here](https://pyauto-desktop.readthedocs.io/en/latest/)
+
 Built on `mss` and `OpenCV`. Designed for scalability. Includes a built-in GUI Inspector.
 
 `pyauto-desktop` is a drop-in replacement for `pyautogui` designed for developers who need their automation scripts to work across different monitors, resolutions, and scaling settings (DPR).
