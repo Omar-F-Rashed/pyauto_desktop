@@ -1,7 +1,5 @@
-# Shared stylesheet for the application
 
-DARK_THEME = """
-QMainWindow {
+DARK_THEME = """QMainWindow {
     background-color: #2b2b2b;
     color: #ffffff;
 }

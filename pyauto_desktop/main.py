@@ -6,24 +6,17 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QSlider,
                              QCheckBox, QTextEdit, QFileDialog, QGroupBox, QMessageBox, QComboBox, QSpinBox,
                              QRadioButton, QFrame)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPoint, QBuffer, QIODevice, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPoint, QSize
 from PyQt6.QtGui import QPixmap, QImage, QIcon
 
-# --- IMPORTS ---
 from .style import DARK_THEME
 from .capture_tool import SnippingController
 from .overlay import Overlay
 from .detection import DetectionWorker
 from .editor import MagicWandEditor
-
-# --- SINGLE SOURCE OF TRUTH IMPORT ---
-# We import the monitor logic directly from functions.py so we share the exact same list.
+from .utils import global_to_local, logical_to_physical, physical_to_logical
 from .functions import get_monitors_safe
 
-# --- CRITICAL FIX: ENABLE DPI AWARENESS ---
-# This forces Windows to treat the app as "Per-Monitor DPI Aware V2".
-
-# --- Windows-specific setup ---
 if sys.platform == "win32":
     import ctypes
 
@@ -34,6 +27,7 @@ if sys.platform == "win32":
     def set_window_display_affinity(hwnd, affinity):
         try:
             user32.SetWindowDisplayAffinity(hwnd, affinity)
+            pass
         except Exception as e:
             print(f"Failed to set display affinity: {e}")
 else:
@@ -105,7 +99,7 @@ class RegionButton(QPushButton):
                 "QPushButton { background-color: #198754; text-align: left; padding-left: 15px; } QPushButton:hover { background-color: #157347; }")
             self.btn_close.show()
         else:
-            self.setStyleSheet("")  # Revert to default
+            self.setStyleSheet("")
             self.btn_close.hide()
 
 
@@ -113,37 +107,37 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Desktop Inspector")
-        self.resize(550, 850)  # Increased height for new controls
+        self.resize(550, 850)
         self.setStyleSheet(DARK_THEME)
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
-        # State
-        self.template_image = None  # This is the TARGET image
-        self.search_region = None  # (x, y, w, h) in Global Logical Coordinates
+        # -- MONITOR SPECS TRACKING --
+        # Used to enforce that all captures happen on compatible monitors
+        # Format: {'dpr': float, 'res': (width, height)}
+        self.primary_specs = None
+
+        self.template_image = None
+        self.search_region = None  # Physical Rect
         self.current_scale = 1.0
         self.is_image_unsaved = False
         self.current_filename = None
         self.last_save_dir = ""
 
-        # Anchor State
         self.anchor_image = None
-        self.anchor_rect = None  # Global Rect (x,y,w,h) where anchor was snipped
-        self.target_rect = None  # Global Rect (x,y,w,h) where target was snipped
+        self.anchor_rect = None  # Physical Rect
+        self.target_rect = None  # Physical Rect
         self.anchor_filename = None
         self.is_anchor_unsaved = False
 
-        # Controllers
         self.snip_controller = SnippingController()
         self.snip_controller.finished.connect(self.on_snip_finished)
         self.active_snip_mode = None
 
-        # Initialize Overlay
         self.overlay = Overlay()
         if sys.platform == "win32":
             self.overlay.winId()
             set_window_display_affinity(int(self.overlay.winId()), WDA_EXCLUDEFROMCAPTURE)
 
-        # Timer-based detection
         self.detection_timer = QTimer(self)
         self.detection_timer.timeout.connect(self.detection_step)
         self.is_detecting = False
@@ -160,22 +154,18 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
-        # --- Header ---
-        lbl_title = QLabel("AutoMate Studio")
+        lbl_title = QLabel("Inspector")
         lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #0d6efd;")
         layout.addWidget(lbl_title, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # --- 1. Capture Section ---
         grp_cap = QGroupBox("1. Image & Region")
         cap_layout = QVBoxLayout()
 
-        # Anchor Mode Toggle
         self.chk_anchor_mode = QCheckBox("Use Anchor Image (Relative Search)")
         self.chk_anchor_mode.setStyleSheet("font-weight: bold; color: #ffc107;")
         self.chk_anchor_mode.stateChanged.connect(self.toggle_anchor_ui)
         cap_layout.addWidget(self.chk_anchor_mode)
 
-        # Anchor UI (Hidden by default)
         self.frm_anchor = QFrame()
         self.frm_anchor.setVisible(False)
         anchor_layout = QVBoxLayout(self.frm_anchor)
@@ -192,7 +182,6 @@ class MainWindow(QMainWindow):
 
         anchor_layout.addLayout(hbox_anchor_btn)
 
-        # Anchor Parameters (Margins X & Y) - Styled like Click Settings
         hbox_anchor_margin = QHBoxLayout()
         self.chk_anchor_margin = QCheckBox("Search Margin")
         self.chk_anchor_margin.setChecked(True)
@@ -218,7 +207,6 @@ class MainWindow(QMainWindow):
 
         anchor_layout.addLayout(hbox_anchor_margin)
 
-        self.lbl_anchor_preview = QLabel("No Anchor")
         self.lbl_anchor_preview = ClickableDropLabel("Click or Drop Target Image Here\n(PNG, JPG, BMP)")
         self.lbl_anchor_preview.clicked.connect(lambda: self.request_upload_image(mode='anchor'))
         self.lbl_anchor_preview.file_dropped.connect(lambda p: self.handle_dropped_image(p, mode='anchor'))
@@ -228,7 +216,6 @@ class MainWindow(QMainWindow):
 
         cap_layout.addWidget(self.frm_anchor)
 
-        # Main Target UI
         hbox_btns = QHBoxLayout()
         self.btn_snip = QPushButton("Snip Target Image")
         self.btn_snip.clicked.connect(self.start_snip_template)
@@ -261,11 +248,9 @@ class MainWindow(QMainWindow):
         grp_cap.setLayout(cap_layout)
         layout.addWidget(grp_cap)
 
-        # --- 2. Parameters ---
         grp_test = QGroupBox("2. Live Test & Action")
         test_layout = QVBoxLayout()
 
-        # Confidence
         hbox_conf = QHBoxLayout()
         hbox_conf.addWidget(QLabel("Confidence:"))
         self.slider_conf = QSlider(Qt.Orientation.Horizontal)
@@ -276,7 +261,6 @@ class MainWindow(QMainWindow):
         hbox_conf.addWidget(self.slider_conf)
         hbox_conf.addWidget(self.lbl_conf_val)
 
-        # Overlap
         hbox_overlap = QHBoxLayout()
         hbox_overlap.addWidget(QLabel("Overlap Threshold:"))
         self.slider_overlap = QSlider(Qt.Orientation.Horizontal)
@@ -290,7 +274,6 @@ class MainWindow(QMainWindow):
         self.chk_gray = QCheckBox("Grayscale (Faster)")
         self.chk_gray.setChecked(True)
 
-        # --- Click / Action Settings ---
         hbox_click = QHBoxLayout()
         self.chk_click = QCheckBox("Simulate Click")
         self.chk_click.stateChanged.connect(self.update_overlay_click_settings)
@@ -315,12 +298,20 @@ class MainWindow(QMainWindow):
         hbox_click.addWidget(QLabel("Y:"))
         hbox_click.addWidget(self.spin_off_y)
 
-        # --- Screen Selection ---
         hbox_screen = QHBoxLayout()
         self.cbo_screens = QComboBox()
         hbox_screen.addWidget(QLabel("Detect On:"))
         hbox_screen.addWidget(self.cbo_screens)
         self.populate_screens()
+
+        hbox_scaling = QHBoxLayout()
+        hbox_scaling.addWidget(QLabel("Scaling Strategy:"))
+        self.cbo_scaling = QComboBox()
+        self.cbo_scaling.addItem("DPR Awareness", "dpr")
+        self.cbo_scaling.addItem("Resolution Matching", "resolution")
+        self.cbo_scaling.setToolTip(
+            "DPR: For non-full screen applications (browser, office apps, etc) \nResolution: Full screen applications like games.")
+        hbox_scaling.addWidget(self.cbo_scaling)
 
         hbox_ctrl = QHBoxLayout()
         self.btn_start = QPushButton("Start Detection")
@@ -336,13 +327,13 @@ class MainWindow(QMainWindow):
         test_layout.addWidget(self.chk_gray)
         test_layout.addLayout(hbox_click)
         test_layout.addLayout(hbox_screen)
+        test_layout.addLayout(hbox_scaling)
         test_layout.addLayout(hbox_ctrl)
         test_layout.addWidget(self.btn_start)
         test_layout.addWidget(self.lbl_status)
         grp_test.setLayout(test_layout)
         layout.addWidget(grp_test)
 
-        # --- 3. Output ---
         grp_out = QGroupBox("3. Generate Code")
         out_layout = QVBoxLayout()
 
@@ -376,6 +367,13 @@ class MainWindow(QMainWindow):
         grp_out.setLayout(out_layout)
         layout.addWidget(grp_out)
 
+        primary = QApplication.primaryScreen()
+        if primary:
+            self.primary_specs = {
+                'dpr': primary.devicePixelRatio(),
+                'res': (primary.geometry().width(), primary.geometry().height())
+            }
+
     def populate_screens(self):
         monitor_rects = get_monitors_safe()
         q_screens = QApplication.screens()
@@ -395,12 +393,13 @@ class MainWindow(QMainWindow):
             self.cbo_screens.addItem(label, matched_q_screen)
 
     def toggle_anchor_ui(self, state):
-        is_visible = (state == Qt.CheckState.Checked.value)
-        self.frm_anchor.setVisible(is_visible)
-        if is_visible:
+        is_anchor_on = (state == Qt.CheckState.Checked.value)
+        self.frm_anchor.setVisible(is_anchor_on)
+
+        if is_anchor_on:
             self.btn_snip.setText("2. Snip Target Image")
         else:
-            self.btn_snip.setText("Snip Image From Screen")
+            self.btn_snip.setText("Snip Target Image")
 
     def toggle_margin_inputs(self, state):
         enabled = (state == Qt.CheckState.Checked.value)
@@ -422,10 +421,9 @@ class MainWindow(QMainWindow):
             self.spin_off_y.value()
         )
 
-    # --- Snipping Handlers ---
     def start_snip_template(self):
         self.hide()
-        self.active_snip_mode = 'template'  # This is Target
+        self.active_snip_mode = 'template'
         self.snip_controller.start()
 
     def start_snip_anchor(self):
@@ -438,24 +436,91 @@ class MainWindow(QMainWindow):
         self.active_snip_mode = 'region'
         self.snip_controller.start()
 
-    def on_snip_finished(self, pixmap, global_rect):
-        self.show()
-        x, y, w, h = global_rect
+    def _optimize_image(self, img):
+        if img.mode == 'RGBA':
+            extrema = img.getextrema()
+            if extrema[3][0] == 255:
+                return img.convert('RGB')
+        return img
 
-        if w < 5 or h < 5: return
+    def on_snip_finished(self, pixmap, physical_rect, target_screen):
+        self.show()
+        if not target_screen:
+            self.active_snip_mode = None
+            return
+
+        x, y, w, h = physical_rect
+        if w < 5 or h < 5:
+            self.active_snip_mode = None
+            return
+
+        captured_dpr = target_screen.devicePixelRatio()
+        captured_res =(target_screen.geometry().width()*captured_dpr, target_screen.geometry().height()*captured_dpr)
+
+        # print(f"Captured on Screen: {captured_res} @ DPR {captured_dpr}")
+
+        is_anchor_mode = self.chk_anchor_mode.isChecked()
+        is_primary = False
+        primary_name = "Target Image"
+
+        if is_anchor_mode:
+            primary_name = "Anchor Image"
+            if self.active_snip_mode == 'anchor':
+                is_primary = True
+        else:
+            if self.active_snip_mode == 'template':
+                is_primary = True
+
+        if is_primary:
+            # We are updating the Primary Element.
+            # Check if we changed monitors.
+            specs_changed = False
+            if self.primary_specs:
+                if (self.primary_specs['dpr'] != captured_dpr) or (self.primary_specs['res'] != captured_res):
+                    specs_changed = True
+            else:
+                specs_changed = True  # First time setting
+
+            self.primary_specs = {'dpr': captured_dpr, 'res': captured_res}
+
+            if specs_changed:
+                # print("Primary monitor specs changed. Resetting secondary elements.")
+                self.reset_secondary_elements(is_anchor_mode)
+
+        else:
+            # We are updating a Secondary Element.
+            # It MUST match the Primary Specs.
+            if self.primary_specs:
+                m_dpr = self.primary_specs['dpr']
+                m_res = self.primary_specs['res']
+
+                if (captured_dpr != m_dpr) or (captured_res != m_res):
+                    QMessageBox.critical(
+                        self,
+                        "Monitor Mismatch",
+                        f"Capture Rejected!\n\n"
+                        f"You are trying to capture a secondary element on a different monitor than your {primary_name}.\n\n"
+                        f"Required Monitor: {m_res} @ DPR {m_dpr}\n"
+                        f"Current Monitor: {captured_res} @ DPR {captured_dpr}\n\n"
+                        f"To switch monitors, please re-capture the {primary_name} on the new monitor first."
+                    )
+                    self.active_snip_mode = None
+                    return
+            else:
+                # Fallback: If no primary exists yet, set this as primary specs
+                self.primary_specs = {'dpr': captured_dpr, 'res': captured_res}
 
         if self.active_snip_mode == 'template':
-            # Target Image
             pil_image = self.qpixmap_to_pil(pixmap)
-            # Pass through editor
             edited_img = self.open_editor(pil_image)
 
             if edited_img:
+                edited_img = self._optimize_image(edited_img)
                 self.template_image = edited_img
                 self.is_image_unsaved = True
                 self.current_filename = None
                 self.btn_gen.setEnabled(False)
-                self.target_rect = global_rect  # Store target global position
+                self.target_rect = physical_rect
                 self.update_preview()
                 self.btn_start.setEnabled(True)
                 self.btn_start.setText("Start Detection")
@@ -463,35 +528,49 @@ class MainWindow(QMainWindow):
                 self.btn_save.setEnabled(True)
 
         elif self.active_snip_mode == 'anchor':
-            # Anchor Image
             pil_image = self.qpixmap_to_pil(pixmap)
-            # Pass through editor
             edited_img = self.open_editor(pil_image)
-
             if edited_img:
+                edited_img = self._optimize_image(edited_img)
                 self.anchor_image = edited_img
-                self.anchor_rect = global_rect  # Store anchor global position
+                self.anchor_rect = physical_rect
                 self.is_anchor_unsaved = True
                 self.anchor_filename = None
                 self.update_anchor_preview()
                 self.btn_save_anchor.setEnabled(True)
-                self.btn_gen.setEnabled(False)  # Need save
+                self.btn_gen.setEnabled(False)
 
         elif self.active_snip_mode == 'region':
-            self.search_region = (x, y, w, h)
+            self.search_region = physical_rect
+            # Using physical rect directly without logical conversion
             self.lbl_region_status.setText(f"Region: {self.search_region}")
             self.btn_region.set_active(True)
 
         self.active_snip_mode = None
+
+    def reset_secondary_elements(self, is_anchor_mode):
+        # Always reset search region as it is secondary in both modes
+        self.reset_region()
+
+        if is_anchor_mode:
+            # In Anchor Mode, Target Image is also secondary
+            self.template_image = None
+            self.target_rect = None
+            self.current_filename = None
+            self.is_image_unsaved = False
+            self.lbl_preview.setText("Click or Drop Target Image Here\n(PNG, JPG, BMP)")
+            self.lbl_preview.setPixmap(QPixmap())
+            self.btn_start.setEnabled(False)
+            self.btn_reedit.setEnabled(False)
+            self.btn_save.setEnabled(False)
+            self.btn_gen.setEnabled(False)
 
     def reset_region(self):
         self.search_region = None
         self.lbl_region_status.setText("Region: Full Screen")
         self.btn_region.set_active(False)
 
-    # --- Image Loading & Editor ---
     def request_upload_image(self, mode='target'):
-        # 1. Check if we need to warn about replacing an existing image
         current_img = self.template_image if mode == 'target' else self.anchor_image
         label = "Target" if mode == 'target' else "Anchor"
 
@@ -505,7 +584,6 @@ class MainWindow(QMainWindow):
             self.process_loaded_image(fname, mode)
 
     def handle_dropped_image(self, path, mode='target'):
-        # 1. Check if we need to warn about replacing
         current_img = self.template_image if mode == 'target' else self.anchor_image
         label = "Target" if mode == 'target' else "Anchor"
 
@@ -519,21 +597,18 @@ class MainWindow(QMainWindow):
     def process_loaded_image(self, path, mode='target'):
         try:
             img = Image.open(path)
-
-            # Shared: Open the editor for either mode
             edited_img = self.open_editor(img)
-            if not edited_img: return  # User cancelled editor
+            if not edited_img: return
 
             filename = os.path.basename(path)
 
             if mode == 'target':
                 self.template_image = edited_img
                 self.current_filename = filename
-                self.target_rect = None  # Reset spatial info for external load
+                self.target_rect = None
                 self.is_image_unsaved = False
                 self.current_scale = QApplication.primaryScreen().devicePixelRatio()
 
-                # Update Target UI
                 self.update_preview()
                 self.btn_start.setEnabled(True)
                 self.btn_start.setText("Start Detection")
@@ -543,14 +618,12 @@ class MainWindow(QMainWindow):
             elif mode == 'anchor':
                 self.anchor_image = edited_img
                 self.anchor_filename = filename
-                self.anchor_rect = None  # Reset spatial info for external load
+                self.anchor_rect = None
                 self.is_anchor_unsaved = False
 
-                # Update Anchor UI
                 self.update_anchor_preview()
                 self.btn_save_anchor.setEnabled(True)
 
-            # Finally, check if we can generate code (checks both images)
             self.check_gen_enable()
 
         except Exception as e:
@@ -564,7 +637,6 @@ class MainWindow(QMainWindow):
                 self.update_preview()
 
     def open_editor(self, pil_img):
-        """Opens the editor modal and returns the result (PIL Image) or None if cancelled."""
         editor = MagicWandEditor(pil_img, self)
         if editor.exec():
             return editor.get_result()
@@ -584,7 +656,6 @@ class MainWindow(QMainWindow):
                        Qt.AspectRatioMode.KeepAspectRatio))
         self.lbl_anchor_preview.setText("")
 
-    # --- Detection Logic ---
     def toggle_detection(self):
         if self.is_detecting:
             self.is_detecting = False
@@ -596,17 +667,13 @@ class MainWindow(QMainWindow):
         else:
             if not self.template_image: return
 
-            # Check Anchor Mode Requirements
             use_anchor = self.chk_anchor_mode.isChecked()
 
             if use_anchor:
                 if not self.anchor_image:
                     QMessageBox.warning(self, "Anchor Missing", "Please snip an anchor image first.")
                     return
-                # Note: We calculate the actual offsets inside detection_step now
-                # to ensure we use the correct DPR of the target screen.
 
-                # Validation only
                 if not (self.anchor_rect and self.target_rect):
                     if QMessageBox.warning(self, "Spatial Data Missing",
                                            "Images were not snipped in this session (no coordinates).\n"
@@ -624,7 +691,7 @@ class MainWindow(QMainWindow):
             self.update_overlay_click_settings()
             self.last_fps_time = time.time()
             self.overlay.show()
-            self.detection_timer.start(50)
+            self.detection_timer.start(10)
             self.btn_start.setText("Stop Detection")
             self.btn_start.setStyleSheet("background-color: #dc3545;")
             self.set_controls_enabled(False)
@@ -638,115 +705,77 @@ class MainWindow(QMainWindow):
         self.chk_anchor_mode.setEnabled(enabled)
         self.btn_snip_anchor.setEnabled(enabled)
         self.btn_gen.setEnabled(enabled and not self.is_image_unsaved)
+        self.cbo_scaling.setEnabled(enabled)
 
     def detection_step(self):
         if self.worker_running or not self.is_detecting: return
         if not self.template_image: self.toggle_detection(); return
 
-        # 1. Determine Search Target
-        target_screen = None
-        if self.search_region:
-            center_x = self.search_region[0] + self.search_region[2] // 2
-            center_y = self.search_region[1] + self.search_region[3] // 2
-            target_screen = QApplication.screenAt(QPoint(center_x, center_y))
-            if not target_screen: target_screen = QApplication.primaryScreen()
-        else:
-            target_screen = self.cbo_screens.currentData()
-            if not target_screen: target_screen = QApplication.primaryScreen()
+        target_screen_idx = self.cbo_screens.currentIndex()
+        if target_screen_idx < 0: target_screen_idx = 0
 
-        if not target_screen: return
+        target_screen_obj = self.cbo_screens.currentData()
+        if not target_screen_obj: target_screen_obj = QApplication.primaryScreen()
 
-        # 2. Grab Screen
-        try:
-            screen_pixmap = target_screen.grabWindow(0)
-            haystack_img = self.qpixmap_to_pil(screen_pixmap)
-        except Exception:
-            return
+        # Capture Source Specs (Passed to worker, no local resizing)
+        source_dpr = self.primary_specs['dpr'] if self.primary_specs else 1.0
+        source_res = self.primary_specs['res'] if self.primary_specs else (1920, 1080)
 
-        # 3. Handle Manual Region
-        offset_x_phys = 0
-        offset_y_phys = 0
+        selected_scaling = self.cbo_scaling.currentData()
 
-        if self.search_region:
-            geo = target_screen.geometry()
-            dpr = target_screen.devicePixelRatio()
-            local_x = self.search_region[0] - geo.x()
-            local_y = self.search_region[1] - geo.y()
-            phys_x = int(local_x * dpr)
-            phys_y = int(local_y * dpr)
-            phys_w = int(self.search_region[2] * dpr)
-            phys_h = int(self.search_region[3] * dpr)
+        img_to_pass = self.template_image
 
-            img_w, img_h = haystack_img.size
-            phys_x = max(0, phys_x)
-            phys_y = max(0, phys_y)
-            phys_w = min(phys_w, img_w - phys_x)
-            phys_h = min(phys_h, img_h - phys_y)
+        local_region = self.search_region
 
-            if phys_w > 0 and phys_h > 0:
-                haystack_img = haystack_img.crop((phys_x, phys_y, phys_x + phys_w, phys_y + phys_h))
-                offset_x_phys = phys_x
-                offset_y_phys = phys_y
-
-        # 4. Context
         self.detection_context = {
-            'screen_geo': target_screen.geometry(),
-            'dpr': target_screen.devicePixelRatio(),
-            'offset_phys': (offset_x_phys, offset_y_phys)
+            'screen_geo': target_screen_obj.geometry(),
+            'dpr': target_screen_obj.devicePixelRatio(),
+            'source_dpr': source_dpr
         }
 
-        # 5. Start Worker
         self.worker_running = True
         conf = self.slider_conf.value() / 100.0
         gray = self.chk_gray.isChecked()
         overlap = self.slider_overlap.value() / 100.0
 
-        # --- PREPARE ANCHOR CONFIG (DYNAMICALLY) ---
         use_anchor = self.chk_anchor_mode.isChecked()
         anchor_img = self.anchor_image if use_anchor else None
         anchor_conf = None
 
-        if use_anchor:
-            if self.anchor_rect and self.target_rect:
-                # Calculate offsets based on Logical Coords from snip
-                ax, ay, aw, ah = self.anchor_rect
-                tx, ty, tw, th = self.target_rect
+        if use_anchor and self.anchor_rect and self.target_rect:
+            ax, ay, _, _ = self.anchor_rect
+            tx, ty, tw, th = self.target_rect
 
-                off_x_log = tx - ax
-                off_y_log = ty - ay
+            offset_x = tx - ax
+            offset_y = ty - ay
 
-                # Scale to Physical Pixels using the TARGET SCREEN's DPR
-                # This ensures the offsets match the haystack image resolution
-                dpr = self.detection_context['dpr']
+            use_margin = self.chk_anchor_margin.isChecked()
+            mx_log = self.spin_margin_x.value() if use_margin else 0
+            my_log = self.spin_margin_y.value() if use_margin else 0
 
-                # Calculate Margins in Physical Pixels
-                use_margin = self.chk_anchor_margin.isChecked()
-                mx_val = self.spin_margin_x.value() if use_margin else 0
-                my_val = self.spin_margin_y.value() if use_margin else 0
+            mx_phys, my_phys, _, _ = logical_to_physical((mx_log, my_log, 0, 0), source_dpr)
 
-                margin_x_phys = int(mx_val * dpr)
-                margin_y_phys = int(my_val * dpr)
-
-                anchor_conf = {
-                    'offset_x': int(off_x_log * dpr),
-                    'offset_y': int(off_y_log * dpr),
-                    'w': int(tw * dpr),  # Target width in physical pixels
-                    'h': int(th * dpr),  # Target height in physical pixels
-                    'margin_x': margin_x_phys,
-                    'margin_y': margin_y_phys
-                }
-            else:
-                # Fallback
-                anchor_conf = {'offset_x': 0, 'offset_y': 0, 'w': 100, 'h': 100, 'margin_x': 0, 'margin_y': 0}
+            anchor_conf = {
+                'offset_x': offset_x,
+                'offset_y': offset_y,
+                'w': tw,
+                'h': th,
+                'margin_x': mx_phys,
+                'margin_y': my_phys
+            }
 
         self.worker = DetectionWorker(
-            self.template_image,
-            haystack_img,
-            conf,
-            gray,
-            overlap,
-            anchor_img,
-            anchor_conf
+            template_img=img_to_pass,
+            screen_idx=target_screen_idx,
+            confidence=conf,
+            grayscale=gray,
+            overlap_threshold=overlap,
+            anchor_img=anchor_img,
+            anchor_config=anchor_conf,
+            search_region=local_region,
+            source_dpr=source_dpr,
+            source_resolution=source_res,
+            scaling_type=selected_scaling
         )
         self.worker.result_signal.connect(self.on_detection_result)
         self.worker.finished.connect(self.on_worker_finished)
@@ -766,38 +795,29 @@ class MainWindow(QMainWindow):
 
         ctx = self.detection_context
         screen_geo = ctx['screen_geo']
-        off_x_phys, off_y_phys = ctx['offset_phys']
         dpr = ctx['dpr']
+        source_dpr = ctx.get('source_dpr', dpr)
 
         self.overlay.set_target_screen_offset(screen_geo.x(), screen_geo.y())
 
-        # Helper to map physical rects to logical screen rects
         def map_rects(raw_rects):
             mapped = []
-            for (rx, ry, rw, rh) in raw_rects:
-                total_x_phys = rx + off_x_phys
-                total_y_phys = ry + off_y_phys
-                log_x = total_x_phys / dpr
-                log_y = total_y_phys / dpr
-                log_w = rw / dpr
-                log_h = rh / dpr
-                mapped.append((log_x, log_y, log_w, log_h))
+            for r in raw_rects:
+                lx, ly, lw, lh = physical_to_logical(r, dpr)
+                mapped.append((lx, ly, lw, lh))
             return mapped
 
-        # Map targets and anchors and regions
         mapped_rects = map_rects(rects)
         mapped_anchors = map_rects(anchors)
         mapped_regions = map_rects(regions)
 
-        self.overlay.update_rects(mapped_rects, mapped_anchors, mapped_regions, 1.0)
+        self.overlay.update_rects(mapped_rects, mapped_anchors, mapped_regions, source_dpr)
 
-        # Status text update
         status_msg = f"Matches: {count} (FPS: {fps})"
         if anchors:
             status_msg += f" | Anchors: {len(anchors)}"
         self.lbl_status.setText(status_msg)
 
-    # --- Generation ---
     def save_image(self):
         if not self.template_image: return
         name = self._save_image_dialog(self.template_image, "target.png")
@@ -830,7 +850,6 @@ class MainWindow(QMainWindow):
         return None
 
     def check_gen_enable(self):
-        # Enable Generate only if required images are saved
         if self.is_image_unsaved:
             self.btn_gen.setEnabled(False)
             return
@@ -845,141 +864,101 @@ class MainWindow(QMainWindow):
     def generate_code(self):
         if not self.template_image: return
 
-        # Common Params
-        screen_idx = self.cbo_screens.currentIndex()
-        if screen_idx < 0: screen_idx = 0
-        screen_obj = self.cbo_screens.currentData()
-
-        # --- FIX: GET DPR TO SCALE GENERATED COORDINATES ---
-        dpr = screen_obj.devicePixelRatio()
-
-        # Get Screen Geometry (Logical) to calculate local coordinates
-        screen_geo = screen_obj.geometry()
-        screen_x_log = screen_geo.x()
-        screen_y_log = screen_geo.y()
-
-        # Physical width/height of the screen for fallback
-        phys_w = int(screen_obj.geometry().width() * dpr)
-        phys_h = int(screen_obj.geometry().height() * dpr)
+        m_res = self.primary_specs['res'] if self.primary_specs else (1920, 1080)
+        phys_w, phys_h = m_res
 
         conf = float(self.lbl_conf_val.text())
         gray = self.chk_gray.isChecked()
         overlap = float(self.lbl_overlap_val.text())
 
-        # Get margins
-        if self.chk_anchor_margin.isChecked():
-            # Scale margins to Physical Pixels
-            mx = int(self.spin_margin_x.value() * dpr)
-            my = int(self.spin_margin_y.value() * dpr)
-        else:
-            mx = 0
-            my = 0
+        screen_idx = self.cbo_screens.currentIndex()
+        use_screen_arg = (screen_idx > 0)
 
-        # Base params helper
         def build_params(img_name, region_var=None):
             p = [f"'images/{img_name}'"]
             if region_var:
                 p.append(f"region={region_var}")
             elif self.search_region and not self.chk_anchor_mode.isChecked():
-                # FIX: Scale static search region to Physical Pixels AND Make Local
-                rx, ry, rw, rh = self.search_region
+                p.append(f"region={self.search_region}")
 
-                # Convert global capture to local relative to the selected screen
-                local_rx = rx - screen_x_log
-                local_ry = ry - screen_y_log
-
-                phys_region = (
-                    int(local_rx * dpr),
-                    int(local_ry * dpr),
-                    int(rw * dpr),
-                    int(rh * dpr)
-                )
-                p.append(f"region={phys_region}")
-
-            if screen_idx != 0: p.append(f"screen={screen_idx}")
+            if use_screen_arg: p.append(f"screen={screen_idx}")
             if gray: p.append(f"grayscale=True")
             if conf != 0.9: p.append(f"confidence={conf}")
             if overlap != 0.5: p.append(f"overlap_threshold={overlap}")
-            p.append(f"original_resolution=({phys_w}, {phys_h})")
             return ", ".join(p)
 
         code_lines = []
-        target_name = self.current_filename.replace('.png', '')
 
-        # --- Click Helper ---
+        target_name = self.current_filename.replace('.png', '')
+        dpr = self.primary_specs['dpr'] if self.primary_specs else 1.0
+        code_lines.append(
+            f'screen{screen_idx} = pyauto_desktop.Session(screen={screen_idx}, source_resolution=({int(m_res[0])}, {int(m_res[1])}), source_dpr={dpr}))')
+
         def get_click_line(var_name, indent="    "):
             off_x = self.spin_off_x.value()
             off_y = self.spin_off_y.value()
             if off_x == 0 and off_y == 0:
-                return f"{indent}pyauto_desktop.clickimage({var_name})"
-            return f"{indent}pyauto_desktop.clickimage({var_name}, offset=({off_x}, {off_y}))"
+                return f"{indent}screen{screen_idx}.clickImage({var_name})"
+            return f"{indent}screen{screen_idx}.clickImage({var_name}, offset=({off_x}, {off_y}))"
 
-        # --- Generation Logic ---
         if self.chk_anchor_mode.isChecked():
-            # === ANCHOR MODE ===
             if not self.anchor_filename: return
             anchor_name = self.anchor_filename.replace('.png', '')
 
-            # 1. Calc Offset
             if not self.anchor_rect or not self.target_rect:
                 code_lines.append("# WARNING: Coordinates missing. Using default offset.")
-                off_x, off_y = 0, 0
-                w, h = 100, 100
+                ax, ay, aw, ah = 0, 0, 100, 100
+                tx, ty, tw, th = 0, 0, 100, 100
             else:
                 ax, ay, aw, ah = self.anchor_rect
                 tx, ty, tw, th = self.target_rect
 
-                # --- FIX: Scale offsets and dimensions to Physical Pixels ---
-                off_x = int((tx - ax) * dpr)
-                off_y = int((ty - ay) * dpr)
-                w = int(tw * dpr)
-                h = int(th * dpr)
+            rel_x = tx - ax
+            rel_y = ty - ay
 
+            mx_log = self.spin_margin_x.value()
+            my_log = self.spin_margin_y.value()
+
+
+            mx, my, _, _ = logical_to_physical((mx_log, my_log, 0, 0), dpr)
             code_lines.append(
-                f"{anchor_name}_matches = pyauto_desktop.locateAllOnScreen({build_params(self.anchor_filename)})")
+                f"{anchor_name}_matches = screen{screen_idx}.locateAllOnScreen({build_params(self.anchor_filename)})")
             code_lines.append(f"for {anchor_name} in {anchor_name}_matches:")
             code_lines.append(f"    ax, ay, aw, ah = {anchor_name}")
 
-            # 3. Define Region
-            final_rel_x = off_x - mx
-            final_rel_y = off_y - my
-            final_w = w + (mx * 2)
-            final_h = h + (my * 2)
+            sign_x = "+" if rel_x >= 0 else "-"
+            sign_y = "+" if rel_y >= 0 else "-"
 
-            sign_x = "+" if final_rel_x >= 0 else "-"
-            sign_y = "+" if final_rel_y >= 0 else "-"
+            final_w = tw + (mx * 2)
+            final_h = th + (my * 2)
 
             code_lines.append(
-                f"    search_region = (ax {sign_x} {abs(final_rel_x)}, ay {sign_y} {abs(final_rel_y)}, {final_w}, {final_h})"
+                f"    search_region = (ax {sign_x} {abs(rel_x)} - {mx}, ay {sign_y} {abs(rel_y)} - {my}, {final_w}, {final_h})"
             )
 
-            # 4. Find Target in Region (UPDATED FOR LOOP)
             params = build_params(self.current_filename, 'search_region')
-            code_lines.append(f"    {target_name}_match = pyauto_desktop.locateOnScreen({params})")
+            code_lines.append(f"    {target_name}_match = screen{screen_idx}.locateOnScreen({params})")
             code_lines.append(f"    if {target_name}_match:")
             code_lines.append(f"        print(f'Found {target_name} at: {{{target_name}_match}}')")
             if self.chk_click.isChecked():
                 code_lines.append(get_click_line(f"{target_name}_match", "        "))
 
             if self.rdo_single.isChecked():
-                # Anchor Mode -> Single Match
                 code_lines.append(f"        break")
             else:
-                # Anchor Mode -> All Matches Loop
                 if self.chk_click.isChecked():
                     code_lines.append(f"        time.sleep(0.5)")
 
         else:
-            # === STANDARD MODE ===
             params = build_params(self.current_filename)
             if self.rdo_single.isChecked():
-                code_lines.append(f"{target_name} = pyauto_desktop.locateOnScreen({params})")
+                code_lines.append(f"{target_name} = screen{screen_idx}.locateOnScreen({params})")
                 code_lines.append(f"if {target_name}:")
                 code_lines.append(f"    print(f'Found {target_name} at: {{{target_name}}}')")
                 if self.chk_click.isChecked():
                     code_lines.append(get_click_line(target_name))
             else:
-                code_lines.append(f"{target_name}_matches = pyauto_desktop.locateAllOnScreen({params})")
+                code_lines.append(f"{target_name}_matches = screen{screen_idx}.locateAllOnScreen({params})")
                 code_lines.append(f"for {target_name} in {target_name}_matches:")
                 code_lines.append(f"    print(f'Found {target_name} at: {{{target_name}}}')")
                 if self.chk_click.isChecked():
@@ -990,15 +969,16 @@ class MainWindow(QMainWindow):
         self.txt_output.setText(code_block)
         QApplication.clipboard().setText(code_block)
         self.lbl_status.setText("Code copied to clipboard!")
-    # --- Utils ---
+
     def pil2pixmap(self, image):
         if image.mode == "RGBA":
             data = image.tobytes("raw", "RGBA")
             qim = QImage(data, image.size[0], image.size[1], QImage.Format.Format_RGBA8888)
         else:
             data = image.convert("RGB").tobytes("raw", "RGB")
-            qim = QImage(data, image.size[0], image.size[1], QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qim)
+            stride = image.size[0] * 3
+            qim = QImage(data, image.size[0], image.size[1], stride, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qim.copy())
 
     def qpixmap_to_pil(self, pixmap):
         try:
@@ -1013,7 +993,6 @@ class MainWindow(QMainWindow):
                 ptr.setsize(height * width * 4)
                 data_bytes = ptr.asstring()
             except (AttributeError, TypeError):
-                # Fallback for PyQt6 variants
                 data_bytes = qimg.bits().asstring(height * width * 4)
 
             return Image.frombytes("RGBA", (width, height), data_bytes, "raw", "RGBA", 0, 1)

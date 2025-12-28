@@ -3,6 +3,7 @@ images/
 *.png
 testing.py
 automated_tester.py
+benchmark.py
 
 __pycache__/
 *.py[cod]

@@ -1,41 +1,46 @@
+import logging
+from typing import List, Tuple, Optional
+
 from PyQt6.QtWidgets import QWidget, QApplication
 from PyQt6.QtCore import Qt, QRect, QPoint
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPaintEvent
+
+from .functions import get_monitors_safe, get_monitor_dpr
+from .utils import local_to_global
 
 
 class Overlay(QWidget):
-    """Transparent overlay to draw bounding boxes and click targets."""
-
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
-                            Qt.WindowType.WindowStaysOnTopHint |
-                            Qt.WindowType.Tool |
-                            Qt.WindowType.WindowTransparentForInput)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-        # Track the top-left corner of the specific screen we are detecting on
-        self.target_offset_x = 0
-        self.target_offset_y = 0
-
-        # Click Visualization Settings
-        self.show_click = False
-        self.click_offset_x = 0
-        self.click_offset_y = 0
-
-        # Calculate bounding box to cover all screens
+        self._setup_ui_flags()
+        self._init_attributes()
         self._update_geometry()
 
-        self.rects = []
-        self.anchors = []  # Store anchor rects separately
-        self.regions = []  # Store search regions
-        self.scale_factor = 1.0
+    def _setup_ui_flags(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        # Font for indices
+    def _init_attributes(self):
+        self.target_offset_x: int = 0
+        self.target_offset_y: int = 0
+
+        self.show_click: bool = False
+        self.click_offset_x: int = 0
+        self.click_offset_y: int = 0
+
+        self.rects: List[Tuple[int, int, int, int]] = []
+        self.anchors: List[Tuple[int, int, int, int]] = []
+        self.regions: List[Tuple[int, int, int, int]] = []
+        self.scale_factor: float = 1.0
+
         self.font_idx = QFont("Arial", 10, QFont.Weight.Bold)
 
     def _update_geometry(self):
-        """Recalculate overlay geometry to cover all screens."""
         screens = QApplication.screens()
         if screens:
             full_rect = screens[0].geometry()
@@ -49,130 +54,177 @@ class Overlay(QWidget):
         super().showEvent(event)
         self._update_geometry()
 
-    def set_target_screen_offset(self, x, y):
+    def set_target_screen_offset(self, x: int, y: int):
         self.target_offset_x = x
         self.target_offset_y = y
 
-    def set_click_config(self, show, off_x, off_y):
+    def set_click_config(self, show: bool, off_x: int, off_y: int):
         self.show_click = show
         self.click_offset_x = off_x
         self.click_offset_y = off_y
         self.update()
 
-    def update_rects(self, rects, anchors, regions, scale_factor):
+    def update_rects(self, rects: list, anchors: list, regions: list, scale_factor: float):
         self.rects = rects
         self.anchors = anchors
         self.regions = regions
         self.scale_factor = scale_factor
         self.update()
 
-    def paintEvent(self, event):
-        if not self.rects and not self.anchors and not self.regions:
+    def _get_matching_monitor(self, monitor_list: list, tx: int, ty: int) -> Optional[tuple]:
+        for i, monitor in enumerate(monitor_list):
+            if monitor[0] == tx and monitor[1] == ty:
+                return i, monitor
+        return None
+
+    def paintEvent(self, event: QPaintEvent):
+        if not (self.rects or self.anchors or self.regions):
             return
 
         try:
             painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setFont(self.font_idx)
 
-            # --- Styles ---
-            # Target (Green)
-            pen_box = QPen(QColor(0, 255, 0), 2)
-            brush_box = QColor(0, 255, 0, 50)
+            styles = {
+                'box': {
+                    'pen': QPen(QColor(0, 255, 0), 2),
+                    'brush': QColor(0, 255, 0, 50)
+                },
+                'anchor': {
+                    'pen': QPen(QColor(0, 100, 255), 2),
+                    'brush': QColor(0, 100, 255, 30)
+                },
+                'region': {
+                    'pen': QPen(QColor(255, 200, 0), 2),
+                    'brush': QColor(255, 200, 0, 10)
+                },
+                'click_dot': {
+                    'pen': QPen(QColor(255, 0, 0), 2),
+                    'brush': QBrush(QColor(255, 0, 0))
+                },
+                'text': {
+                    'bg_brush': QBrush(QColor(0, 0, 0, 180)),
+                    'pen': QPen(QColor(255, 255, 255)),
+                    'anchor_pen': QPen(QColor(100, 200, 255))
+                }
+            }
 
-            # Anchor (Blue)
-            pen_anchor = QPen(QColor(0, 100, 255), 2)  # Nice Blue
-            pen_anchor.setStyle(Qt.PenStyle.DashLine)
-            brush_anchor = QColor(0, 100, 255, 30)
+            styles['anchor']['pen'].setStyle(Qt.PenStyle.DashLine)
+            styles['region']['pen'].setStyle(Qt.PenStyle.DotLine)
 
-            # Search Region (Yellow)
-            pen_region = QPen(QColor(255, 200, 0), 2)
-            pen_region.setStyle(Qt.PenStyle.DotLine)
-            brush_region = QColor(255, 200, 0, 10)
+            monitors = get_monitors_safe()
 
-            # Click Dot (Red)
-            pen_dot = QPen(QColor(255, 0, 0), 2)
-            brush_dot = QBrush(QColor(255, 0, 0))
-
-            # Text
-            brush_text_bg = QBrush(QColor(0, 0, 0, 180))
-            pen_text = QPen(QColor(255, 255, 255))
-            pen_text_anchor = QPen(QColor(100, 200, 255))
-
-            # Helper to draw a set of rects
-            def draw_set(rect_list, pen, brush, label_prefix, is_anchor=False, is_region=False):
-                painter.setPen(pen)
-                painter.setBrush(brush)
-
-                for i, (x, y, w, h) in enumerate(rect_list):
-                    # --- Map Logic ---
-                    global_x = x + self.target_offset_x
-                    global_y = y + self.target_offset_y
-                    top_left_local = self.mapFromGlobal(QPoint(int(global_x), int(global_y)))
-
-                    draw_x = top_left_local.x()
-                    draw_y = top_left_local.y()
-                    draw_w = int(round(w))
-                    draw_h = int(round(h))
-
-                    # Draw Box
-                    painter.drawRect(draw_x, draw_y, draw_w, draw_h)
-
-                    # Skip labels/dots for regions if desired, or keep them simple
-                    if is_region:
-                        continue
-
-                    # Draw Label
-                    label_text = f"{label_prefix}{i}"
-                    fm = painter.fontMetrics()
-                    text_w = fm.horizontalAdvance(label_text) + 8
-                    text_h = fm.height() + 4
-
-                    # Position label
-                    label_x = draw_x
-                    label_y = draw_y - text_h
-                    if label_y < 0: label_y = draw_y
-
-                    # Label Background
-                    painter.save()  # Save state for temp brush change
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(brush_text_bg)
-                    painter.drawRect(label_x, label_y, text_w, text_h)
-                    painter.restore()
-
-                    # Label Text
-                    painter.save()
-                    painter.setPen(pen_text_anchor if is_anchor else pen_text)
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawText(QRect(label_x, label_y, text_w, text_h),
-                                     Qt.AlignmentFlag.AlignCenter, label_text)
-                    painter.restore()
-
-                    # Draw Click Target (Only for Targets, not Anchors)
-                    if not is_anchor and not is_region and self.show_click:
-                        local_center_x = draw_x + (draw_w / 2)
-                        local_center_y = draw_y + (draw_h / 2)
-
-                        target_local = QPoint(
-                            int(local_center_x + self.click_offset_x),
-                            int(local_center_y + self.click_offset_y)
-                        )
-                        painter.save()
-                        painter.setPen(pen_dot)
-                        painter.setBrush(brush_dot)
-                        painter.drawEllipse(target_local, 4, 4)
-                        painter.restore()
-
-            # 1. Draw Search Regions (Bottom Layer)
             if self.regions:
-                draw_set(self.regions, pen_region, brush_region, "R", is_region=True)
+                self._draw_element_group(
+                    painter, self.regions, monitors, styles['region'], styles['text'],
+                    label_prefix="R", is_region=True
+                )
 
-            # 2. Draw Anchors
             if self.anchors:
-                draw_set(self.anchors, pen_anchor, brush_anchor, "A", is_anchor=True)
+                self._draw_element_group(
+                    painter, self.anchors, monitors, styles['anchor'], styles['text'],
+                    label_prefix="A", is_anchor=True
+                )
 
-            # 3. Draw Targets (Top Layer)
             if self.rects:
-                draw_set(self.rects, pen_box, brush_box, "#", is_anchor=False)
+                self._draw_element_group(
+                    painter, self.rects, monitors, styles['box'], styles['text'],
+                    label_prefix="#", click_style=styles['click_dot']
+                )
 
         except Exception as e:
             print(f"Overlay paint error: {e}")
+
+    def _draw_element_group(self, painter: QPainter, rect_list: list, monitors: list,
+                            style: dict, text_style: dict, label_prefix: str,
+                            is_anchor: bool = False, is_region: bool = False, click_style: dict = None):
+        painter.setPen(style['pen'])
+        painter.setBrush(style['brush'])
+
+        _idxscreen, selected_monitor = self._get_matching_monitor(monitors, self.target_offset_x, self.target_offset_y)
+
+        if not selected_monitor:
+            return
+
+        dpr = self.devicePixelRatioF()
+        for i, (x, y, w, h) in enumerate(rect_list):
+            gx, gy, _, _ = local_to_global((x, y, w, h), (self.target_offset_x, self.target_offset_y))
+            global_point = QPoint(int(gx), int(gy))
+
+            max_x = (x + w) * dpr
+            max_y = (y + h) * dpr
+
+            if x * dpr > selected_monitor[2] or y * dpr > selected_monitor[3]:
+                continue
+            elif x < 0:
+                x = 0
+            elif y < 0:
+                y = 0
+            elif max_x > selected_monitor[2]:
+                w = w - (max_x - selected_monitor[2]) / dpr
+            elif max_y > selected_monitor[3]:
+                h = h - (max_y - selected_monitor[3]) / dpr
+            top_left_local = self.mapFromGlobal(QPoint(int(gx), int(gy)))
+
+            scaling = self.scale_factor/get_monitor_dpr(_idxscreen, monitors)
+
+
+            draw_x = top_left_local.x()
+            draw_y = top_left_local.y()
+            draw_w = int(round(w)/scaling)
+            draw_h = int(round(h)/scaling)
+
+            painter.drawRect(draw_x, draw_y, draw_w, draw_h)
+
+            if is_region:
+                continue
+
+            label_text = f"{label_prefix}{i}"
+            fm = painter.fontMetrics()
+            text_w = fm.horizontalAdvance(label_text) + 8
+            text_h = fm.height() + 4
+
+            label_x = draw_x
+            label_y = draw_y - text_h
+            if label_y < 0:
+                label_y = draw_y
+
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(text_style['bg_brush'])
+            painter.drawRect(label_x, label_y, text_w, text_h)
+            painter.restore()
+
+            painter.save()
+            painter.setPen(text_style['anchor_pen'] if is_anchor else text_style['pen'])
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawText(QRect(label_x, label_y, text_w, text_h),
+                             Qt.AlignmentFlag.AlignCenter, label_text)
+            painter.restore()
+
+            if not is_anchor and not is_region and self.show_click and click_style:
+                center_x = draw_x + (draw_w / 2)
+                center_y = draw_y + (draw_h / 2)
+
+                target_x = center_x + self.click_offset_x
+                target_y = center_y + self.click_offset_y
+
+                local_target_x = x + (draw_w / 2) + self.click_offset_x
+                local_target_y = y + (draw_h / 2) + self.click_offset_y
+                dpr_target_x = local_target_x * dpr
+                dpr_target_y = local_target_y * dpr
+
+                if (dpr_target_x > selected_monitor[2] or
+                        dpr_target_y > selected_monitor[3] or
+                        dpr_target_x < 0 or
+                        dpr_target_y < 0):
+                    continue
+
+                target_local = QPoint(int(target_x), int(target_y))
+
+                painter.save()
+                painter.setPen(click_style['pen'])
+                painter.setBrush(click_style['brush'])
+                painter.drawEllipse(target_local, 4, 4)
+                painter.restore()
