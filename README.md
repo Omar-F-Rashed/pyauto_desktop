@@ -76,7 +76,8 @@ import pyauto_desktop
 session = pyauto_desktop.Session(
     screen=1,
     source_resolution=(2560, 1440),
-    source_dpr=1.25
+    source_dpr=1.25,
+    scaling_type="dpr"
 )
 
 # Search for the image
