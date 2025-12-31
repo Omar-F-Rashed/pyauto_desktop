@@ -5,3 +5,4 @@ numpy~=2.2.6
 setuptools~=80.9.0
 pynput~=1.8.1
 mss~=10.1.0
+pydirectinput~=1.0.4

@@ -81,6 +81,10 @@ API Reference
         - ``str``
         - ``None``
         - The strategy for coordinate translation: ``'dpr'`` or ``'resolution'``. See *Scaling Strategies* below for details.
+      * - **direct_input**
+        - ``bool``
+        - ``False``
+        - **WINDOWS ONLY**, Uses ``'pydirectinput'`` (hardware scancodes) instead of ``'pynput'`` (virtual keys). Essential for applications, games, or Citrix/RDP sessions that ignore standard software-simulated input.
 
    **Scaling Strategies**
 
