@@ -560,16 +560,26 @@ class Session:
     The 'screen' is immutable for the lifetime of the Session.
     """
 
-    def __init__(self, screen=0, source_resolution=None, source_dpr=None, scaling_type=None):
+    def __init__(self, screen=0, source_resolution=None, source_dpr=None, scaling_type=None, direct_input=False):
         self._screen = screen  # Immutable: No public setter
         self.source_resolution = source_resolution
         self.source_dpr = source_dpr
         self.scaling_type = scaling_type
+        self.direct_input = direct_input
+
+        if self.direct_input:
+            if platform.system() != "Windows":
+                raise OSError("direct_input=True is only supported on Windows.")
+            global pydirectinput
+            import pydirectinput
+            pydirectinput.FAILSAFE = False
 
     def __del__(self):
         pass
 
     def _fail_safe_check(self):
+        # When using pydirectinput, the pynput controller might not reflect true position if pydirectinput moved it
+        # However, checking (0,0) is still valid for mouse position generally.
         x, y = _mouse_controller.position
         if x == 0 and y == 0:
             raise FailSafeException("Fail-safe triggered from mouse position (0, 0)")
@@ -643,7 +653,8 @@ class Session:
             return sct_img, capture_left - monitor_left, capture_top - monitor_top, scale_factor
 
     def locateAllOnScreen(self, image, region=None, grayscale=False, confidence=0.9, overlap_threshold=0.5,
-                          scaling_type=None, source_resolution=None, source_dpr=None, time_out=0, downscale=3, use_pyramid=True,
+                          scaling_type=None, source_resolution=None, source_dpr=None, time_out=0, downscale=3,
+                          use_pyramid=True,
                           return_conf=False):
         """
         Locate all instances of 'image' on the Session's screen.
@@ -727,12 +738,13 @@ class Session:
 
                 time.sleep(0.01)
 
-    def locateOnScreen(self, image, region=None, grayscale=False, confidence=0.9, source_resolution=None, scaling_type=None, source_dpr=None, time_out=0, downscale=3, use_pyramid=True,):
-        
+    def locateOnScreen(self, image, region=None, grayscale=False, confidence=0.9, source_resolution=None,
+                       scaling_type=None, source_dpr=None, time_out=0, downscale=3, use_pyramid=True, ):
+
         effective_scaling = scaling_type if scaling_type is not None else self.scaling_type
         effective_resolution = source_resolution if source_resolution is not None else self.source_resolution
         effective_dpr = source_dpr if source_dpr is not None else self.source_dpr
-        
+
         matches = self.locateAllOnScreen(
             image=image,
             region=region,
@@ -770,7 +782,10 @@ class Session:
         self._fail_safe_check()
 
         if duration <= 0:
-            _mouse_controller.position = (dest_x, dest_y)
+            if self.direct_input:
+                pydirectinput.moveTo(int(dest_x), int(dest_y))
+            else:
+                _mouse_controller.position = (dest_x, dest_y)
             self._fail_safe_check()
         else:
             start_x, start_y = _mouse_controller.position
@@ -785,21 +800,27 @@ class Session:
                 cur_x = start_x + (dest_x - start_x) * ratio
                 cur_y = start_y + (dest_y - start_y) * ratio
 
-                _mouse_controller.position = (int(cur_x), int(cur_y))
+                if self.direct_input:
+                    pydirectinput.moveTo(int(cur_x), int(cur_y))
+                else:
+                    _mouse_controller.position = (int(cur_x), int(cur_y))
 
                 self._fail_safe_check()
                 time.sleep(0.005)
 
-            _mouse_controller.position = (dest_x, dest_y)
+            if self.direct_input:
+                pydirectinput.moveTo(int(dest_x), int(dest_y))
+            else:
+                _mouse_controller.position = (dest_x, dest_y)
             self._fail_safe_check()
 
-    def click(self, target=None, y=None, offset=(0, 0), button='left', clicks=1, interval=0.2):
+    def click(self, target=None, y=None, offset=(0, 0), button='left', clicks=1, interval=0.2, hold_time=0):
         self._fail_safe_check()
 
         if isinstance(target, list):
             if DEBUG_LEVEL >= 1: print(f"Debug: Processing list of {len(target)} matches.")
             for item in target:
-                self.click(item, offset=offset, button=button, clicks=clicks)
+                self.click(item, offset=offset, button=button, clicks=clicks, interval=interval, hold_time=hold_time)
                 time.sleep(interval)
             return
 
@@ -812,10 +833,23 @@ class Session:
         if target is None:
             if offset != (0, 0):
                 cur_x, cur_y = _mouse_controller.position
-                _mouse_controller.position = (cur_x + offset[0], cur_y + offset[1])
+                if self.direct_input:
+                    pydirectinput.moveTo(int(cur_x + offset[0]), int(cur_y + offset[1]))
+                else:
+                    _mouse_controller.position = (cur_x + offset[0], cur_y + offset[1])
+                time.sleep(0.025)
 
             self._fail_safe_check()
-            _mouse_controller.click(pynput_button, clicks)
+            if self.direct_input:
+                for i in range(clicks):
+                    pydirectinput.mouseDown(button=button)
+                    if hold_time > 0:
+                        time.sleep(hold_time)
+                    pydirectinput.mouseUp(button=button)
+                    if i < clicks - 1:
+                        time.sleep(interval)
+            else:
+                _mouse_controller.click(pynput_button, clicks)
             return
 
         if isinstance(target, (int, float)) and isinstance(y, (int, float)):
@@ -850,14 +884,27 @@ class Session:
         global_target_x = monitor_left + local_target_x
         global_target_y = monitor_top + local_target_y
 
-        _mouse_controller.position = (global_target_x, global_target_y)
         self._fail_safe_check()
-        _mouse_controller.click(pynput_button, clicks)
+
+        if self.direct_input:
+            pydirectinput.moveTo(int(global_target_x), int(global_target_y))
+            for i in range(clicks):
+                pydirectinput.mouseDown(button=button)
+                if hold_time > 0:
+                    time.sleep(hold_time)
+                pydirectinput.mouseUp(button=button)
+                if i < clicks - 1:
+                    time.sleep(interval)
+        else:
+            _mouse_controller.position = (global_target_x, global_target_y)
+            _mouse_controller.click(pynput_button, clicks)
 
     def write(self, message, interval=0.0):
         self._fail_safe_check()
 
-        if interval == 0:
+        if self.direct_input:
+            pydirectinput.write(message, interval=interval)
+        elif interval == 0:
             _keyboard_controller.type(message)
         else:
             for char in message:
@@ -868,12 +915,18 @@ class Session:
     def press(self, key):
         self._fail_safe_check()
 
-        pynput_key = key
-        if isinstance(key, str) and len(key) > 1:
-            if hasattr(Key, key):
-                pynput_key = getattr(Key, key)
+        if self.direct_input:
+            k = key
+            if isinstance(key, Key):
+                k = key.name
+            pydirectinput.press(k)
+        else:
+            pynput_key = key
+            if isinstance(key, str) and len(key) > 1:
+                if hasattr(Key, key):
+                    pynput_key = getattr(Key, key)
 
-        _keyboard_controller.tap(pynput_key)
+            _keyboard_controller.tap(pynput_key)
 
     def locateAny(self, tasks, time_out=0):
         start_time = time.time()

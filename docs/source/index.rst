@@ -51,7 +51,7 @@ Here is a basic example of locating an image and clicking it.
 API Reference
 =============
 
-.. class:: Session(screen=0, source_resolution=None, source_dpr=None, scaling_type=None)
+.. class:: Session(screen=0, source_resolution=None, source_dpr=None, scaling_type=None, direct_input=False)
 
    The core class that manages screen capture and coordinate translation.
 
@@ -81,6 +81,10 @@ API Reference
         - ``str``
         - ``None``
         - The strategy for coordinate translation: ``'dpr'`` or ``'resolution'``. See *Scaling Strategies* below for details.
+      * - **direct_input**
+        - ``bool``
+        - ``False``
+        - **WINDOWS ONLY**, Uses ``'pydirectinput'`` (hardware scancodes) instead of ``'pynput'`` (virtual keys). Essential for applications, games, or Citrix/RDP sessions that ignore standard software-simulated input.
 
    **Scaling Strategies**
 
@@ -314,7 +318,7 @@ API Reference
             #use mana potion
 
 
-.. method:: click(target=None, y=None, offset=(0,0), button='left', clicks=1, interval=0.2)
+.. method:: click(target=None, y=None, offset=(0,0), button='left', clicks=1, interval=0.2, hold_time=0)
 
    Performs a mouse click.
    It can target a coordinate, a match result, a list of matches, or just click where the mouse currently is.
@@ -353,6 +357,10 @@ API Reference
         - ``float``
         - ``0.2``
         - Delay in seconds between clicks if clicking multiple times or a list of targets.
+      * - **hold_time**
+        - ``float``
+        - ``0``
+        - Delay between mouseDown and mouseUp for direct input. **Only if direct_input is True in Session**
 
    **Returns:** A list of  dictionaries ``[{label: [match_list]}, label: [match_list]}]``.
 
